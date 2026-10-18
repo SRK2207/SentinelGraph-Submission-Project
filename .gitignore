@@ -1,0 +1,30 @@
+# Python
+backend/venv/
+backend/__pycache__/
+backend/*/__pycache__/
+backend/*/*/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# Environment files
+*.env
+!.env.example
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Node / Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+.npm/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

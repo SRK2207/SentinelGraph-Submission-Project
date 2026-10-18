@@ -1,0 +1,129 @@
+{
+  "id": "scenario-ambiguous-timeout",
+  "name": "Payment Reconciliation Timeout — Ambiguous Cause",
+  "category": "External Infrastructure Timeout",
+  "description": "Daily payment reconciliation failed due to an upstream gateway timeout. Recent code commits are unrelated to the failure path.",
+  "difficulty": "Ambiguous / Insufficient Evidence",
+  "failure": {
+    "failure_id": "FAIL-8842",
+    "timestamp": "2026-10-11T08:00:20Z",
+    "workflow_id": "wf-payment-reconcile",
+    "workflow_name": "Daily Payment Reconciler",
+    "affected_component": "reconciliation-worker",
+    "error_type": "GatewayTimeoutError",
+    "error_message": "GatewayTimeoutError: Upstream payment settlement gateway timed out after 30000ms.",
+    "execution_id": "exec_run_44018299",
+    "environment": "production-eu",
+    "stack_trace": "File \"/app/workers/reconciler.py\", line 88, in sync_gateway\n    response = settlement_client.get_daily_batch(timeout=30.0)\nGatewayTimeoutError: Upstream payment settlement gateway timed out after 30000ms"
+  },
+  "service": {
+    "service_id": "srv-payment-gateway-proxy",
+    "name": "Settlement Gateway Client",
+    "endpoint": "POST https://settlement.partner.example.test/v2/batch",
+    "current_schema": {
+      "batch_id": "BATCH-902",
+      "status": "processing"
+    },
+    "previous_schema": {
+      "batch_id": "BATCH-902",
+      "status": "processing"
+    }
+  },
+  "recent_commits": [
+    {
+      "commit_id": "7b32c01",
+      "author": "a.kumar@example.test",
+      "timestamp": "2026-10-11T07:40:11Z",
+      "message": "docs(readme): update developer onboarding setup guide",
+      "files_changed": [
+        "README.md",
+        "docs/local-dev.md"
+      ],
+      "deployed": true,
+      "environment": "production-eu"
+    },
+    {
+      "commit_id": "3d99f12",
+      "author": "l.taylor@example.test",
+      "timestamp": "2026-10-11T06:15:44Z",
+      "message": "style(admin): fix button padding in settlement dashboard portal",
+      "files_changed": [
+        "portal/styles/buttons.css"
+      ],
+      "deployed": true,
+      "environment": "production-eu"
+    }
+  ],
+  "commit_diffs": {
+    "7b32c01": {
+      "commit_id": "7b32c01",
+      "file": "README.md",
+      "diff": "@@ -5,1 +5,1 @@\n-# Getting Started\n+# Local Developer Quickstart Guide",
+      "description": "Updated README documentation title."
+    },
+    "3d99f12": {
+      "commit_id": "3d99f12",
+      "file": "portal/styles/buttons.css",
+      "diff": "@@ -22,1 +22,1 @@\n-padding: 8px 12px;\n+padding: 8px 16px;",
+      "description": "Adjusted CSS padding."
+    }
+  },
+  "workflow_definition": {
+    "workflow_id": "wf-payment-reconcile",
+    "name": "Daily Payment Reconciler",
+    "description": "Pulls daily transaction settlement files and reconciles against internal ledger.",
+    "trigger": "cron(0 8 * * *)",
+    "steps": [
+      {
+        "step_id": "step_1",
+        "name": "authenticate_partner_gateway",
+        "action": "oauth_token_exchange",
+        "target": "auth.partner.example.test"
+      },
+      {
+        "step_id": "step_2",
+        "name": "fetch_daily_batch",
+        "action": "http_request",
+        "target": "POST https://settlement.partner.example.test/v2/batch",
+        "timeout_seconds": 30
+      },
+      {
+        "step_id": "step_3",
+        "name": "match_ledger_records",
+        "action": "sql_batch_reconcile",
+        "target": "ledger_db"
+      }
+    ]
+  },
+  "dependencies": {
+    "workflow_id": "wf-payment-reconcile",
+    "downstream_components": ["finance-reporting-dashboard"],
+    "upstream_services": [
+      {
+        "service_id": "srv-partner-gateway",
+        "endpoint": "https://settlement.partner.example.test",
+        "consumed_fields": ["settlement_id", "total_cleared", "records"],
+        "criticality": "critical"
+      }
+    ],
+    "field_contracts": []
+  },
+  "remediation_options": [
+    {
+      "option_id": "opt-retry-with-backoff",
+      "title": "Configure Exponential Backoff Retry Policy",
+      "target": "wf-payment-reconcile",
+      "description": "Increase HTTP client timeout from 30s to 60s and add 3 retries with exponential backoff.",
+      "trade_offs": "Helps buffer against transient upstream network degradation; may delay alerting if upstream provider is experiencing prolonged outage.",
+      "resolves_failure": true
+    },
+    {
+      "option_id": "opt-rollback-commits",
+      "title": "Rollback Recent Repository Commits",
+      "target": "code-repository",
+      "description": "Revert commits 7b32c01 and 3d99f12.",
+      "trade_offs": "Irrelevant: Commits only touched docs and frontend styles and could not have caused upstream gateway timeouts.",
+      "resolves_failure": false
+    }
+  ]
+}

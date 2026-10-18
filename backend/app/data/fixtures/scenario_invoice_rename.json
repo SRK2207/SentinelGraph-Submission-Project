@@ -1,0 +1,174 @@
+{
+  "id": "scenario-invoice-field-rename",
+  "name": "Invoice Workflow Failure — Backend Field Rename",
+  "category": "Contract Incompatibility",
+  "description": "Invoice generation failed because a backend API response field 'customer_email' was renamed to 'email' in a recent deployment.",
+  "difficulty": "Standard",
+  "failure": {
+    "failure_id": "FAIL-9021",
+    "timestamp": "2026-10-11T09:30:15Z",
+    "workflow_id": "wf-invoice-gen-v2",
+    "workflow_name": "Invoice Customer Dispatcher",
+    "affected_component": "invoice-generator",
+    "error_type": "SchemaFieldMissingError",
+    "error_message": "KeyError: 'customer_email' - Required field customer_email was not found in customer response.",
+    "execution_id": "exec_run_88192301",
+    "environment": "staging-primary",
+    "stack_trace": "File \"/app/workflows/invoice_dispatcher.py\", line 42, in process_invoice\n    recipient_email = customer_data[\"customer_email\"]\nKeyError: 'customer_email'"
+  },
+  "service": {
+    "service_id": "srv-customer-api",
+    "name": "Customer Profile Service",
+    "endpoint": "GET /api/v1/customer/{customer_id}",
+    "current_schema": {
+      "customer_id": "CUST-1042",
+      "email": "customer@example.test",
+      "customer_name": "Alex Morgan",
+      "tier": "enterprise"
+    },
+    "previous_schema": {
+      "customer_id": "CUST-1042",
+      "customer_email": "customer@example.test",
+      "customer_name": "Alex Morgan",
+      "tier": "enterprise"
+    }
+  },
+  "recent_commits": [
+    {
+      "commit_id": "4f8a12d",
+      "author": "j.doe@example.test",
+      "timestamp": "2026-10-11T09:14:22Z",
+      "message": "refactor(customer-api): standardize response fields to simplify schema",
+      "files_changed": [
+        "services/customer/api.py",
+        "services/customer/models.py"
+      ],
+      "deployed": true,
+      "environment": "staging-primary"
+    },
+    {
+      "commit_id": "9c12b7e",
+      "author": "s.chen@example.test",
+      "timestamp": "2026-10-11T08:45:10Z",
+      "message": "chore(deps): bump redis client to 5.0.2",
+      "files_changed": [
+        "requirements.txt",
+        "services/common/cache.py"
+      ],
+      "deployed": true,
+      "environment": "staging-primary"
+    },
+    {
+      "commit_id": "1a4e88f",
+      "author": "m.ross@example.test",
+      "timestamp": "2026-10-11T07:20:00Z",
+      "message": "fix(auth): update session token expiration window to 3600s",
+      "files_changed": [
+        "services/auth/tokens.py"
+      ],
+      "deployed": true,
+      "environment": "staging-primary"
+    }
+  ],
+  "commit_diffs": {
+    "4f8a12d": {
+      "commit_id": "4f8a12d",
+      "file": "services/customer/api.py",
+      "diff": "@@ -38,7 +38,7 @@ def get_customer(customer_id: str):\n     return {\n         \"customer_id\": customer.id,\n-        \"customer_email\": customer.email,\n+        \"email\": customer.email,\n         \"customer_name\": customer.name,\n         \"tier\": customer.tier\n     }",
+      "description": "Renamed dictionary key 'customer_email' to 'email' in JSON response payload."
+    },
+    "9c12b7e": {
+      "commit_id": "9c12b7e",
+      "file": "requirements.txt",
+      "diff": "@@ -14,1 +14,1 @@\n-redis==4.6.0\n+redis==5.0.2",
+      "description": "Updated redis client dependency version."
+    },
+    "1a4e88f": {
+      "commit_id": "1a4e88f",
+      "file": "services/auth/tokens.py",
+      "diff": "@@ -12,1 +12,1 @@\n-SESSION_TTL = 1800\n+SESSION_TTL = 3600",
+      "description": "Extended session token TTL."
+    }
+  },
+  "workflow_definition": {
+    "workflow_id": "wf-invoice-gen-v2",
+    "name": "Invoice Customer Dispatcher",
+    "description": "Dispatches monthly PDF invoices to customer email address upon billing cycle close.",
+    "trigger": "scheduled_or_webhook",
+    "steps": [
+      {
+        "step_id": "step_1",
+        "name": "fetch_pending_invoices",
+        "action": "query_database",
+        "target": "billing_db.invoices"
+      },
+      {
+        "step_id": "step_2",
+        "name": "get_customer_details",
+        "action": "http_request",
+        "target": "GET /api/v1/customer/{customer_id}",
+        "consumes_service": "srv-customer-api"
+      },
+      {
+        "step_id": "step_3",
+        "name": "extract_email_for_delivery",
+        "action": "extract_field",
+        "expected_field": "customer_email",
+        "required": true
+      },
+      {
+        "step_id": "step_4",
+        "name": "dispatch_invoice_pdf",
+        "action": "email_gateway_send",
+        "target": "mail.gateway.service"
+      }
+    ]
+  },
+  "dependencies": {
+    "workflow_id": "wf-invoice-gen-v2",
+    "downstream_components": ["billing-notification-worker"],
+    "upstream_services": [
+      {
+        "service_id": "srv-customer-api",
+        "endpoint": "GET /api/v1/customer/{customer_id}",
+        "consumed_fields": ["customer_id", "customer_email", "customer_name"],
+        "criticality": "high"
+      }
+    ],
+    "field_contracts": [
+      {
+        "field_name": "customer_email",
+        "type": "string (email)",
+        "producer": "srv-customer-api",
+        "consumer": "wf-invoice-gen-v2:step_3",
+        "status": "broken"
+      }
+    ]
+  },
+  "remediation_options": [
+    {
+      "option_id": "opt-workflow-update",
+      "title": "Update Workflow Field Mapping",
+      "target": "wf-invoice-gen-v2",
+      "description": "Update invoice workflow step 3 to consume 'email' field instead of 'customer_email'.",
+      "trade_offs": "Immediate fix localized to invoice workflow; requires updating any other consumers if they also rely on customer_email.",
+      "resolves_failure": true
+    },
+    {
+      "option_id": "opt-backend-alias",
+      "title": "Restore Backward-Compatible Alias in Backend API",
+      "target": "srv-customer-api",
+      "description": "Expose both 'email' and 'customer_email' (deprecated alias) in customer service API response.",
+      "trade_offs": "Preserves backward compatibility for all consumers; leaves deprecated alias in API contract until scheduled retirement.",
+      "resolves_failure": true
+    },
+    {
+      "option_id": "opt-restart-worker",
+      "title": "Restart Workflow Execution Worker",
+      "target": "invoice-generator",
+      "description": "Restart the workflow engine worker pods without code or schema changes.",
+      "trade_offs": "Does not address root cause; workflow will fail immediately upon next attempt.",
+      "resolves_failure": false
+    }
+  ]
+}
