@@ -355,3 +355,124 @@ def test_demo_reset_behavior(client):
     # Verify investigation record was cleared
     get_resp = client.get(f"/api/investigations/{inv_id}")
     assert get_resp.status_code == 404
+
+
+# 21. Tool argument aliasing (commit_hash, count, etc.)
+def test_tool_argument_aliases():
+    # Test commit_hash alias
+    res_commit = inspect_commit("scenario-invoice-field-rename", commit_hash="4f8a12d")
+    assert res_commit["status"] == "success"
+    assert res_commit["commit_id"] == "4f8a12d"
+
+    # Test sha alias
+    res_sha = inspect_commit("scenario-invoice-field-rename", sha="4f8a12d")
+    assert res_sha["status"] == "success"
+    assert res_sha["commit_id"] == "4f8a12d"
+
+    # Test count alias for limit
+    res_count = get_recent_commits("scenario-invoice-field-rename", count=2)
+    assert res_count["status"] == "success"
+    assert len(res_count["commits"]) == 2
+
+
+# 22. Evidence degradation when diff is unobserved
+def test_report_degradation_without_diff():
+    orchestrator = AgentOrchestrator()
+    scenario = get_scenario("scenario-invoice-field-rename")
+    # Only supply failure details without diff inspection
+    fail_res = get_failure_details("scenario-invoice-field-rename")
+    partial_evidence = orchestrator._extract_evidence_from_result("get_failure_details", {"scenario_id": "scenario-invoice-field-rename"}, fail_res)
+
+    report = orchestrator._construct_structured_report(
+        investigation_id="INV-DEGRADE-TEST",
+        scenario_id="scenario-invoice-field-rename",
+        scenario=scenario,
+        mode="AI AGENT MODE",
+        evidence_list=partial_evidence
+    )
+
+    assert report.root_cause.confidence == 0.65
+    assert report.root_cause.confidence_label == "Moderate Assessment"
+    assert report.root_cause.status == "unconfirmed"
+    assert len(report.remaining_unknowns) > 0
+    # Supporting evidence IDs must match the observed evidence only
+    observed_ids = {e.id for e in partial_evidence}
+    for ref_id in report.root_cause.evidence_ids:
+        assert ref_id in observed_ids
+
+
+# 23. Zero evidence handling
+def test_report_zero_evidence():
+    orchestrator = AgentOrchestrator()
+    scenario = get_scenario("scenario-invoice-field-rename")
+    report = orchestrator._construct_structured_report(
+        investigation_id="INV-ZERO-TEST",
+        scenario_id="scenario-invoice-field-rename",
+        scenario=scenario,
+        mode="AI AGENT MODE",
+        evidence_list=[]
+    )
+
+    assert report.status == "unresolved"
+    assert report.root_cause.confidence == 0.20
+    assert report.root_cause.confidence_label == "Unconfirmed / Insufficient Evidence"
+    assert report.root_cause.status == "unconfirmed"
+    assert report.root_cause.evidence_ids == []
+
+
+# 24. Verification engine edge cases
+def test_verifier_invalid_inputs():
+    # Invalid scenario
+    res_bad_scenario = VerificationEngine.verify_remediation("non-existent-scenario", "opt-1")
+    assert res_bad_scenario.status == "failed"
+    assert "not found" in res_bad_scenario.message
+
+    # Invalid option
+    res_bad_opt = VerificationEngine.verify_remediation("scenario-invoice-field-rename", "non-existent-option")
+    assert res_bad_opt.status == "failed"
+    assert "not recognized" in res_bad_opt.message
+
+
+# 25. End-to-end investigation API lifecycle
+def test_full_investigation_api_lifecycle(client):
+    # 1. Start investigation
+    start_resp = client.post(
+        "/api/investigations",
+        json={"scenario_id": "scenario-invoice-field-rename", "force_deterministic": True}
+    )
+    assert start_resp.status_code == 201
+    inv_id = start_resp.json()["investigation_id"]
+
+    # 2. Get events
+    events_resp = client.get(f"/api/investigations/{inv_id}/events")
+    assert events_resp.status_code == 200
+    events = events_resp.json()
+    assert len(events) >= 5
+
+    # 3. Get causal graph
+    graph_resp = client.get(f"/api/investigations/{inv_id}/graph")
+    assert graph_resp.status_code == 200
+    graph = graph_resp.json()
+    assert len(graph["nodes"]) >= 4
+    assert len(graph["edges"]) >= 3
+
+    # 4. Get report
+    report_resp = client.get(f"/api/investigations/{inv_id}/report")
+    assert report_resp.status_code == 200
+    report = report_resp.json()
+    assert report["status"] == "completed"
+    assert report["root_cause"]["status"] == "probable"
+
+    # 5. Apply remediation
+    rem_resp = client.post(
+        f"/api/investigations/{inv_id}/remediation",
+        json={"option_id": "opt-workflow-update"}
+    )
+    assert rem_resp.status_code == 200
+    assert rem_resp.json()["verification"]["status"] == "passed"
+
+    # 6. Verify investigation endpoint
+    verify_resp = client.post(f"/api/investigations/{inv_id}/verify")
+    assert verify_resp.status_code == 200
+    assert verify_resp.json()["status"] == "passed"
+

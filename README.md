@@ -54,10 +54,9 @@ SentinelGraph solves this problem by autonomously investigating the failure, col
 
 ## Installation & Setup
 
-### 1. Clone & Setup Workspace
+### 1. Repository Directory
 ```bash
-git clone <repo-url>
-cd SentinelGraph-MVP
+cd sentinelgraph-submission
 ```
 
 ### 2. Backend Setup
@@ -126,21 +125,24 @@ Open your browser at `http://localhost:3000`.
 
 ## Running Automated Backend Tests
 
-The project includes an automated test suite covering all 20 required backend test cases:
+The project includes an automated test suite covering 25 comprehensive backend test cases:
 ```bash
 backend\venv\Scripts\pytest.exe backend\app\tests\test_backend.py -v
 ```
 
-All 20 tests verify:
+All 25 tests verify:
 - Health and scenario endpoints
 - All 5 investigation tools (`get_failure_details`, `get_recent_commits`, `get_workflow_definition`, `get_dependency_info`, `inspect_commit`)
+- Tool argument aliasing (e.g., `commit_hash`, `sha`, `count`)
 - Argument and payload validation
 - Agent iteration and tool-call safety limits
 - Missing API key & Gemini error fallbacks
-- Evidence provenance integrity
+- Evidence provenance integrity & zero-evidence degradation
+- Uncertainty handling & confidence reduction when code diffs are unobserved
 - NetworkX graph construction and edge validation
 - Simulated successful and unsuccessful remediations
-- Uncertainty handling in ambiguous scenarios
+- Verifier edge cases and error handling
+- End-to-end investigation API lifecycle
 - Demo reset behavior
 
 ---

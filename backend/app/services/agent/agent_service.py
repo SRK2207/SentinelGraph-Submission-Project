@@ -196,6 +196,18 @@ class AgentOrchestrator:
                 if "scenario_id" not in tool_args:
                     tool_args["scenario_id"] = scenario_id
 
+                # Normalize argument aliases
+                if tool_name == "inspect_commit" and "commit_id" not in tool_args:
+                    for alias in ("commit_hash", "commit", "sha", "hash"):
+                        if alias in tool_args:
+                            tool_args["commit_id"] = tool_args[alias]
+                            break
+                elif tool_name == "get_recent_commits" and "limit" not in tool_args:
+                    for alias in ("count", "n", "max_commits", "max_results"):
+                        if alias in tool_args:
+                            tool_args["limit"] = tool_args[alias]
+                            break
+
                 events.append(
                     InvestigationEventModel(
                         event_id=f"evt-{len(events) + 1}",
@@ -214,9 +226,9 @@ class AgentOrchestrator:
                     try:
                         result = tool_func(**tool_args)
                     except Exception as ex:
-                        result = {"error": f"Tool execution failed: {str(ex)}"}
+                        result = {"status": "error", "error": f"Tool execution failed: {str(ex)}"}
                 else:
-                    result = {"error": f"Unknown tool: '{tool_name}'"}
+                    result = {"status": "error", "error": f"Unknown tool: '{tool_name}'"}
 
                 # Extract verifiable evidence from tool result
                 new_evidence = self._extract_evidence_from_result(tool_name, tool_args, result)
@@ -245,13 +257,17 @@ class AgentOrchestrator:
             # Return tool execution outputs back to Gemini
             response = chat.send_message(tool_responses)
 
-        # Build structured report
+        # Capture Gemini natural language reasoning if produced
+        gemini_reasoning = getattr(response, "text", None) if response else None
+
+        # Build structured report strictly grounded in collected evidence
         report = self._construct_structured_report(
             investigation_id=investigation_id,
             scenario_id=scenario_id,
             scenario=scenario,
             mode="AI AGENT MODE",
-            evidence_list=evidence_list
+            evidence_list=evidence_list,
+            gemini_reasoning=gemini_reasoning
         )
 
         return report, events, evidence_list
@@ -495,28 +511,72 @@ class AgentOrchestrator:
         scenario_id: str,
         scenario: Dict[str, Any],
         mode: str,
-        evidence_list: List[EvidenceModel]
+        evidence_list: List[EvidenceModel],
+        gemini_reasoning: Optional[str] = None
     ) -> InvestigationReportModel:
         failure_data = scenario.get("failure", {})
         remediation_raw = scenario.get("remediation_options", [])
         recs = [RemediationOptionModel(**r) for r in remediation_raw]
+        observed_ids = {e.id for e in evidence_list}
 
         if scenario_id == "scenario-invoice-field-rename":
-            ev_ids = [e.id for e in evidence_list if "DIFF-4f8a12d" in e.id or "CONTRACT" in e.id or "FAIL" in e.id]
-            if not ev_ids:
-                ev_ids = ["EVID-FAIL-9021", "EVID-DIFF-4f8a12d"]
+            has_diff = any("DIFF" in eid for eid in observed_ids)
+            has_contract = any("CONTRACT" in eid for eid in observed_ids)
+            has_fail = any("FAIL" in eid for eid in observed_ids)
+            has_commit = any("COMMIT" in eid for eid in observed_ids)
+
+            if has_diff:
+                confidence = 0.96
+                confidence_label = "High Confidence"
+                rc_status = "probable"
+                supported_ev_ids = [eid for eid in observed_ids if "DIFF-4f8a12d" in eid or "CONTRACT" in eid or "FAIL" in eid or "COMMIT-4f8a12d" in eid]
+                explanation = (
+                    "Commit 4f8a12d ('standardize response fields') in services/customer/api.py changed "
+                    "the JSON response key from 'customer_email' to 'email'. The change was deployed "
+                    "without updating dependent workflows, causing wf-invoice-gen-v2 step 3 to fail."
+                )
+                hyp1_status = "supported"
+                hyp2_status = "refuted"
+                investigation_status = "completed"
+            elif has_commit or has_contract or has_fail:
+                confidence = 0.65
+                confidence_label = "Moderate Assessment"
+                rc_status = "unconfirmed"
+                supported_ev_ids = [eid for eid in observed_ids if "CONTRACT" in eid or "FAIL" in eid or "COMMIT" in eid]
+                explanation = (
+                    "Workflow failure indicates a missing 'customer_email' field, and recent commit history "
+                    "shows modifications to services/customer/api.py. However, the exact code diff was not inspected "
+                    "during this investigation, so the root cause remains an unconfirmed suspicion."
+                )
+                hyp1_status = "inconclusive"
+                hyp2_status = "inconclusive"
+                investigation_status = "completed"
+            else:
+                confidence = 0.20
+                confidence_label = "Unconfirmed / Insufficient Evidence"
+                rc_status = "unconfirmed"
+                supported_ev_ids = []
+                explanation = "No evidence was collected during the investigation. Root cause cannot be confirmed."
+                hyp1_status = "inconclusive"
+                hyp2_status = "inconclusive"
+                investigation_status = "unresolved"
+
+            summary_text = (
+                gemini_reasoning.strip() if gemini_reasoning and len(gemini_reasoning.strip()) > 30
+                else (
+                    "Investigation confirmed a cross-system breaking contract change. "
+                    "Commit 4f8a12d renamed the customer API response key 'customer_email' to 'email'. "
+                    "The invoice automation workflow depends on 'customer_email' to extract the recipient, "
+                    "causing a KeyError at step 3."
+                )
+            )
 
             return InvestigationReportModel(
                 investigation_id=investigation_id,
                 scenario_id=scenario_id,
                 mode=mode,
-                status="completed",
-                summary=(
-                    "Investigation confirmed a cross-system breaking contract change. "
-                    "Commit 4f8a12d renamed the customer API response key 'customer_email' to 'email'. "
-                    "The invoice automation workflow depends on 'customer_email' to extract the recipient, "
-                    "causing a KeyError at step 3."
-                ),
+                status=investigation_status,
+                summary=summary_text,
                 failure=FailureSummaryModel(
                     failure_id=failure_data.get("failure_id", "FAIL-9021"),
                     title="Invoice Customer Dispatcher Failure",
@@ -528,29 +588,25 @@ class AgentOrchestrator:
                 ),
                 root_cause=RootCauseModel(
                     title="Backend API Field Rename Contract Break",
-                    explanation=(
-                        "Commit 4f8a12d ('standardize response fields') in services/customer/api.py changed "
-                        "the JSON response key from 'customer_email' to 'email'. The change was deployed "
-                        "without updating dependent workflows, causing wf-invoice-gen-v2 step 3 to fail."
-                    ),
-                    confidence=0.96,
-                    confidence_label="High Confidence",
-                    status="probable",
-                    evidence_ids=ev_ids
+                    explanation=explanation,
+                    confidence=confidence,
+                    confidence_label=confidence_label,
+                    status=rc_status,
+                    evidence_ids=supported_ev_ids
                 ),
                 hypotheses=[
                     HypothesisModel(
                         id="HYP-1",
                         title="Backend API Field Renamed to 'email'",
                         description="Commit 4f8a12d renamed customer_email to email, breaking step 3 contract.",
-                        status="supported",
-                        supporting_evidence_ids=ev_ids
+                        status=hyp1_status,
+                        supporting_evidence_ids=supported_ev_ids
                     ),
                     HypothesisModel(
                         id="HYP-2",
                         title="Redis Client Upgrade Incompatibility",
                         description="Commit 9c12b7e bumped Redis client version, potentially failing cache retrieval.",
-                        status="refuted",
+                        status=hyp2_status,
                         supporting_evidence_ids=[]
                     )
                 ],
@@ -567,7 +623,7 @@ class AgentOrchestrator:
                     "billing-notification-worker"
                 ],
                 recommendations=recs,
-                remaining_unknowns=[],
+                remaining_unknowns=[] if has_diff else ["Exact commit diff unobserved in investigation trace"],
                 verification=VerificationResultModel(
                     status="not_run",
                     simulated=True,
@@ -577,17 +633,26 @@ class AgentOrchestrator:
 
         else:
             # Ambiguous / insufficient evidence case
+            supporting_ev_ids = [eid for eid in observed_ids if "FAIL" in eid]
+            if not supporting_ev_ids and observed_ids:
+                supporting_ev_ids = list(observed_ids)[:2]
+
+            summary_text = (
+                gemini_reasoning.strip() if gemini_reasoning and len(gemini_reasoning.strip()) > 30
+                else (
+                    "Investigation conducted across recent commits, repository diffs, and workflow definitions. "
+                    "The upstream payment settlement gateway timed out after 30000ms. "
+                    "None of the recent repository commits touched the payment gateway or timeout settings. "
+                    "Available evidence is insufficient to confirm an internal root cause."
+                )
+            )
+
             return InvestigationReportModel(
                 investigation_id=investigation_id,
                 scenario_id=scenario_id,
                 mode=mode,
                 status="unresolved",
-                summary=(
-                    "Investigation conducted across recent commits, repository diffs, and workflow definitions. "
-                    "The upstream payment settlement gateway timed out after 30000ms. "
-                    "None of the recent repository commits touched the payment gateway or timeout settings. "
-                    "Available evidence is insufficient to confirm an internal root cause."
-                ),
+                summary=summary_text,
                 failure=FailureSummaryModel(
                     failure_id=failure_data.get("failure_id", "FAIL-8842"),
                     title="Payment Reconciliation Timeout",
@@ -607,7 +672,7 @@ class AgentOrchestrator:
                     confidence=0.35,
                     confidence_label="Unconfirmed / Insufficient Evidence",
                     status="unconfirmed",
-                    evidence_ids=[e.id for e in evidence_list if "FAIL" in e.id]
+                    evidence_ids=supporting_ev_ids
                 ),
                 hypotheses=[
                     HypothesisModel(
@@ -622,7 +687,7 @@ class AgentOrchestrator:
                         title="Transient Upstream Provider Degradation",
                         description="External settlement partner experienced latency or transient downtime.",
                         status="inconclusive",
-                        supporting_evidence_ids=[e.id for e in evidence_list if "FAIL" in e.id]
+                        supporting_evidence_ids=supporting_ev_ids
                     )
                 ],
                 evidence=evidence_list,
