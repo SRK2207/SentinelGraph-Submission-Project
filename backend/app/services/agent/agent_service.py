@@ -105,18 +105,23 @@ class AgentOrchestrator:
             except Exception as e:
                 err_str = str(e).lower()
                 is_rate_limit = "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str or "rate limit" in err_str
-                is_server_busy = "503" in err_str or "unavailable" in err_str or "high demand" in err_str
+                is_server_error = (
+                    "500" in err_str or "internal" in err_str
+                    or "502" in err_str or "bad gateway" in err_str
+                    or "503" in err_str or "unavailable" in err_str or "high demand" in err_str
+                    or "504" in err_str or "timeout" in err_str
+                )
 
-                if (is_rate_limit or is_server_busy) and attempt < max_retries - 1:
-                    wait_sec = 12 * (attempt + 1)
-                    reason = "Free-tier rate limit (RPM) reached" if is_rate_limit else "Gemini servers temporarily busy (503)"
+                if (is_rate_limit or is_server_error) and attempt < max_retries - 1:
+                    wait_sec = 5 * (attempt + 1) if is_server_error else 12 * (attempt + 1)
+                    reason = "Free-tier rate limit (RPM) reached" if is_rate_limit else "Transient Google server error (500/503)"
                     msg = f"{reason}. Automatically pausing for {wait_sec}s before retrying (attempt {attempt + 1}/{max_retries})..."
                     logger.warning(msg)
                     events.append(
                         InvestigationEventModel(
                             event_id=f"evt-{len(events) + 1}",
                             timestamp=self._now(),
-                            stage="Rate Limit Throttling",
+                            stage="Resilience Retry",
                             type="status",
                             message=msg,
                             is_gemini_native=True
@@ -162,6 +167,29 @@ class AgentOrchestrator:
             )
         )
 
+        # Pre-gather baseline diagnostic status (tests and manifests)
+        # This saves multiple API round trips, prevents exhausting RPM quotas, and gives the model instant context
+        baseline_test = run_tests(project_id=project_id)
+        initial_test_failure = None
+        if not baseline_test.get("passed", True):
+            initial_test_failure = baseline_test
+
+        new_evidence = self._extract_workspace_evidence("run_tests", {"project_id": project_id}, baseline_test)
+        evidence_list.extend(new_evidence)
+
+        events.append(
+            InvestigationEventModel(
+                event_id=f"evt-{len(events) + 1}",
+                timestamp=self._now(),
+                stage="Baseline Diagnosis",
+                type="tool_result",
+                message=f"Diagnostic tests: {'PASSED' if baseline_test.get('passed') else 'FAILED'}",
+                tool_name="run_tests",
+                tool_result=baseline_test,
+                is_gemini_native=True
+            )
+        )
+
         client = genai.Client(api_key=self.api_key)
 
         tool_list = [
@@ -182,14 +210,12 @@ class AgentOrchestrator:
             "You are operating on a real software project inside an isolated workspace.\n"
             f"The target project_id is: '{project_id}'.\n\n"
             "YOUR INVESTIGATION & REPAIR PROTOCOL:\n"
-            "1. First, discover existing tests using `discover_tests_and_commands` and run them with `run_tests`.\n"
-            "2. If tests fail, inspect the stack trace and failing assertion.\n"
-            "3. Read the failing test file and related source files with `read_file` to locate the defect.\n"
-            "4. Search the project codebase with `search_code` if needed to understand imports or schema contracts.\n"
-            "5. Apply a targeted fix using `edit_file` (or `write_file`) to resolve the root cause.\n"
-            "6. Immediately re-run `run_tests` to verify that all tests now pass!\n"
-            "7. Call `get_workspace_diff` to review your patch.\n"
-            "8. Formulate a final summary explaining what broke, why it broke, and how your fix resolved it.\n"
+            "1. Inspect the stack trace, failing file, and assertion provided in the diagnostic baseline.\n"
+            "2. Read the failing source files with `read_file` or search with `search_code` to locate the defect.\n"
+            "3. Apply a targeted fix using `edit_file` (or `write_file`) to resolve the root cause.\n"
+            "4. Immediately re-run `run_tests` to verify that all tests now pass!\n"
+            "5. Call `get_workspace_diff` to review your patch.\n"
+            "6. Formulate a final summary explaining what broke, why it broke, and how your fix resolved it.\n"
             "Base all your reasoning on actual tool execution outputs."
         )
 
@@ -202,10 +228,17 @@ class AgentOrchestrator:
             )
         )
 
+        test_summary = baseline_test.get("output", "")
+        if len(test_summary) > 2500:
+            test_summary = test_summary[-2500:]
+
         initial_prompt = (
             f"Please investigate project '{project.get('name')}' (project_id: '{project_id}').\n"
-            f"User Goal / Issue: {issue_description or 'Run tests, diagnose any failures or defects, apply a verified code fix, and confirm resolution.'}\n"
-            "Begin by discovering tests and running them to inspect the baseline status."
+            f"User Goal / Issue: {issue_description or 'Diagnose test failures, apply a verified code fix, and confirm resolution.'}\n\n"
+            f"DIAGNOSTIC BASELINE:\n"
+            f"- Status: {'PASSED' if baseline_test.get('passed') else 'FAILED'}\n"
+            f"- Execution Output:\n```\n{test_summary}\n```\n\n"
+            "Inspect this diagnostic output, read relevant files, apply the required fix using `edit_file`, and verify with `run_tests`."
         )
 
         events.append(
