@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from google import genai
@@ -32,6 +33,14 @@ from backend.app.schemas.investigation import (
 )
 
 logger = logging.getLogger("sentinelgraph.agent")
+
+MODEL_COMPATIBILITY_MAP = {
+    "gemini-2.5-flash": "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-2.0-flash": "gemini-3.5-flash-lite",
+    "gemini-1.5-flash": "gemini-3.5-flash-lite",
+    "gemini-2.5-pro": "gemini-3.1-pro-preview",
+}
 
 
 class AgentOrchestrator:
@@ -83,6 +92,40 @@ class AgentOrchestrator:
             logger.error(f"Gemini live agent execution failed: {e}", exc_info=True)
             raise RuntimeError(f"Live AI Agent investigation failed: {str(e)}")
 
+    def _send_chat_message(
+        self,
+        chat: Any,
+        content: Any,
+        events: List[InvestigationEventModel],
+        max_retries: int = 4
+    ) -> Any:
+        for attempt in range(max_retries):
+            try:
+                return chat.send_message(content)
+            except Exception as e:
+                err_str = str(e).lower()
+                is_rate_limit = "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str or "rate limit" in err_str
+                is_server_busy = "503" in err_str or "unavailable" in err_str or "high demand" in err_str
+
+                if (is_rate_limit or is_server_busy) and attempt < max_retries - 1:
+                    wait_sec = 12 * (attempt + 1)
+                    reason = "Free-tier rate limit (RPM) reached" if is_rate_limit else "Gemini servers temporarily busy (503)"
+                    msg = f"{reason}. Automatically pausing for {wait_sec}s before retrying (attempt {attempt + 1}/{max_retries})..."
+                    logger.warning(msg)
+                    events.append(
+                        InvestigationEventModel(
+                            event_id=f"evt-{len(events) + 1}",
+                            timestamp=self._now(),
+                            stage="Rate Limit Throttling",
+                            type="status",
+                            message=msg,
+                            is_gemini_native=True
+                        )
+                    )
+                    time.sleep(wait_sec)
+                else:
+                    raise
+
     def _run_gemini_project_loop(
         self,
         investigation_id: str,
@@ -93,13 +136,28 @@ class AgentOrchestrator:
         events: List[InvestigationEventModel] = []
         evidence_list: List[EvidenceModel] = []
 
+        active_model = self.model_name
+        if active_model in MODEL_COMPATIBILITY_MAP:
+            mapped_model = MODEL_COMPATIBILITY_MAP[active_model]
+            events.append(
+                InvestigationEventModel(
+                    event_id=f"evt-{len(events) + 1}",
+                    timestamp=self._now(),
+                    stage="Model Routing",
+                    type="status",
+                    message=f"Model '{active_model}' is deprecated for new keys; automatically routed to active compatible model '{mapped_model}'.",
+                    is_gemini_native=True
+                )
+            )
+            active_model = mapped_model
+
         events.append(
             InvestigationEventModel(
                 event_id=f"evt-{len(events) + 1}",
                 timestamp=self._now(),
                 stage="Agent Initialization",
                 type="status",
-                message=f"Gemini Agent initialized with model '{self.model_name}' for project '{project.get('name')}'.",
+                message=f"Gemini Agent initialized with model '{active_model}' for project '{project.get('name')}'.",
                 is_gemini_native=True
             )
         )
@@ -136,7 +194,7 @@ class AgentOrchestrator:
         )
 
         chat = client.chats.create(
-            model=self.model_name,
+            model=active_model,
             config=types.GenerateContentConfig(
                 tools=tool_list,
                 system_instruction=system_instruction,
@@ -161,7 +219,7 @@ class AgentOrchestrator:
             )
         )
 
-        response = chat.send_message(initial_prompt)
+        response = self._send_chat_message(chat, initial_prompt, events)
         iterations = 0
         total_tool_calls = 0
 
@@ -243,8 +301,11 @@ class AgentOrchestrator:
                     )
                 )
 
-            # Return tool execution outputs back to Gemini
-            response = chat.send_message(tool_responses)
+            # Small pacing pause between tool iterations to stay smoothly under free tier RPM limits
+            time.sleep(1.5)
+
+            # Return tool execution outputs back to Gemini with safe retry
+            response = self._send_chat_message(chat, tool_responses, events)
 
         # Final verification: execute real tests in the workspace to evaluate final state
         final_test_run = run_tests(project_id=project_id)
