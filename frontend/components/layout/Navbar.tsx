@@ -7,9 +7,9 @@ import {
   Sparkles,
   Server,
   Activity,
-  GitBranch,
   FileText,
   Network,
+  UploadCloud,
 } from "lucide-react";
 import { HealthStatus } from "@/types";
 
@@ -34,7 +34,7 @@ export function Navbar({
 
   const navItems = [
     { id: "dashboard", label: "Dashboard", shortLabel: "Dashboard", icon: Activity },
-    { id: "investigate", label: "Investigate", shortLabel: "Investigate", icon: ShieldAlert },
+    { id: "investigate", label: "Upload & Project", shortLabel: "Project", icon: UploadCloud },
     {
       id: "workspace",
       label: "Live Workspace",
@@ -51,12 +51,12 @@ export function Navbar({
     },
     {
       id: "report",
-      label: "Report & Remediation",
-      shortLabel: "Report",
+      label: "Repair & Verification",
+      shortLabel: "Repair",
       icon: FileText,
       disabled: !hasActiveInvestigation,
     },
-    { id: "connections", label: "Connections", shortLabel: "Connections", icon: Server },
+    { id: "connections", label: "Sandboxes", shortLabel: "Sandboxes", icon: Server },
   ];
 
   return (
@@ -74,7 +74,7 @@ export function Navbar({
               </span>
             </div>
             <p className="text-[11px] text-slate-400 font-medium hidden sm:block">
-              Cross-System Failure Investigation Platform
+              AI Software Project Investigation & Repair Agent
             </p>
           </div>
         </div>
@@ -117,7 +117,7 @@ export function Navbar({
             title={
               isAiMode
                 ? `Running live Gemini agent with model: ${health?.gemini_model}`
-                : "Deterministic Demo Mode enabled (safe local evaluation)"
+                : "Gemini API key is required in backend/.env for live agent execution"
             }
           >
             <span
@@ -125,7 +125,7 @@ export function Navbar({
                 isAiMode ? "bg-emerald-400 animate-pulse" : "bg-amber-400"
               }`}
             />
-            <span>{isAiMode ? "AI AGENT MODE" : "DETERMINISTIC DEMO MODE"}</span>
+            <span>{isAiMode ? "LIVE AI AGENT" : "API KEY REQUIRED"}</span>
           </div>
 
           {/* Reset Demo Button */}
@@ -133,10 +133,10 @@ export function Navbar({
             onClick={onResetDemo}
             disabled={isResetting}
             className="flex items-center space-x-1.5 rounded-md border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-surface-secondary hover:text-white transition-all disabled:opacity-50 whitespace-nowrap flex-shrink-0"
-            title="Reset synthetic fixtures and in-memory investigations"
+            title="Reset workspace snapshots and cleared investigations"
           >
             <RotateCcw className={`h-3.5 w-3.5 ${isResetting ? "animate-spin" : ""}`} />
-            <span className="hidden sm:inline">Reset State</span>
+            <span className="hidden sm:inline">Reset Workspace</span>
           </button>
         </div>
       </div>

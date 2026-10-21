@@ -1,32 +1,40 @@
+import io
+import sys
+import zipfile
 import pytest
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 from backend.app.main import app
 from backend.app.core.config import settings
-from backend.app.data.scenarios import get_scenario, reset_all_scenarios
-from backend.app.services.tools.investigation_tools import (
-    get_failure_details,
-    get_recent_commits,
-    get_workflow_definition,
-    get_dependency_info,
-    inspect_commit,
+from backend.app.services.workspace.workspace_manager import workspace_manager, WorkspaceSecurityError
+from backend.app.services.tools.workspace_tools import (
+    list_project_files,
+    search_code,
+    read_file,
+    inspect_dependencies,
+    discover_tests_and_commands,
+    run_tests,
+    edit_file,
+    write_file,
+    revert_file,
+    get_workspace_diff,
 )
 from backend.app.services.graph.graph_engine import CausalGraphEngine
 from backend.app.services.agent.agent_service import AgentOrchestrator
-from backend.app.services.verification.verifier import VerificationEngine
-from backend.app.schemas.investigation import (
-    StartInvestigationRequest,
-    ApplyRemediationRequest,
-    InvestigationReportModel
-)
+from backend.app.schemas.investigation import StartInvestigationRequest
 
 
 @pytest.fixture(autouse=True)
-def reset_fixtures():
-    reset_all_scenarios()
-    yield
-    reset_all_scenarios()
+def clean_workspaces():
+    # Setup sample project
+    meta = workspace_manager.create_sample_broken_project()
+    yield meta
+    # Cleanup / reset
+    try:
+        workspace_manager.reset_project(meta["project_id"])
+    except Exception:
+        pass
 
 
 @pytest.fixture
@@ -40,439 +48,351 @@ def test_health_endpoint(client):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "healthy"
+    assert "version" in data
     assert "mode" in data
-    assert "gemini_model" in data
+    assert "gemini_configured" in data
 
 
-# 2. Scenario retrieval
-def test_scenario_retrieval(client):
-    response = client.get("/api/scenarios")
+# 2. Dashboard endpoint
+def test_dashboard_endpoint(client):
+    response = client.get("/api/dashboard")
     assert response.status_code == 200
-    scenarios = response.json()
-    assert len(scenarios) >= 2
-    scenario_ids = [s["id"] for s in scenarios]
-    assert "scenario-invoice-field-rename" in scenario_ids
-    assert "scenario-ambiguous-timeout" in scenario_ids
+    data = response.json()
+    assert "total_investigations" in data
+    assert "uploaded_projects" in data
+    assert "mode_available" in data
 
 
-# 3. Failure details tool
-def test_failure_details_tool():
-    res = get_failure_details("scenario-invoice-field-rename")
+# 3. Connections endpoint
+def test_connections_endpoint(client):
+    response = client.get("/api/connections")
+    assert response.status_code == 200
+    conns = response.json()
+    assert len(conns) >= 2
+    conn_ids = [c["id"] for c in conns]
+    assert "conn-workspace-fs" in conn_ids
+    assert "conn-subprocess-runner" in conn_ids
+
+
+# 4. Sample project creation
+def test_sample_project_creation(client):
+    response = client.post("/api/projects/sample")
+    assert response.status_code == 201
+    data = response.json()
+    assert data["project_id"] == "sample-broken-invoice-project"
+    assert data["file_count"] >= 4
+    assert "customer_service.py" in data["files"]
+    assert "test_invoice_worker.py" in data["files"]
+
+
+# 5. Project listing & retrieval
+def test_project_listing_and_retrieval(client):
+    response = client.get("/api/projects")
+    assert response.status_code == 200
+    projects = response.json()
+    assert len(projects) >= 1
+    sample_id = projects[0]["project_id"]
+
+    get_resp = client.get(f"/api/projects/{sample_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["project_id"] == sample_id
+
+
+# 6. Safe ZIP extraction & path traversal rejection
+def test_zip_upload_and_path_traversal_protection(client):
+    # Test valid zip upload
+    valid_zip_buf = io.BytesIO()
+    with zipfile.ZipFile(valid_zip_buf, "w") as zf:
+        zf.writestr("module.py", "def add(a, b): return a + b\n")
+        zf.writestr("test_module.py", "from module import add\ndef test_add(): assert add(1, 2) == 3\n")
+
+    valid_zip_buf.seek(0)
+    upload_resp = client.post(
+        "/api/projects/upload",
+        files={"file": ("valid_project.zip", valid_zip_buf.getvalue(), "application/zip")}
+    )
+    assert upload_resp.status_code == 201
+    proj_id = upload_resp.json()["project_id"]
+    assert upload_resp.json()["file_count"] == 2
+
+    # Test malicious zip upload with path traversal entry (../../evil.txt)
+    evil_zip_buf = io.BytesIO()
+    with zipfile.ZipFile(evil_zip_buf, "w") as zf:
+        zf.writestr("../../evil.txt", "MALICIOUS CONTENT")
+    evil_zip_buf.seek(0)
+
+    evil_resp = client.post(
+        "/api/projects/upload",
+        files={"file": ("evil_project.zip", evil_zip_buf.getvalue(), "application/zip")}
+    )
+    assert evil_resp.status_code == 400
+    assert "Path traversal attempt detected" in evil_resp.json()["detail"]
+
+
+# 7. Workspace Tool: list_project_files
+def test_tool_list_project_files():
+    res = list_project_files("sample-broken-invoice-project")
     assert res["status"] == "success"
-    assert res["failure_id"] == "FAIL-9021"
-    assert "customer_email" in res["error_message"]
-    assert res["affected_component"] == "invoice-generator"
+    file_paths = [f["path"] for f in res["files"]]
+    assert "customer_service.py" in file_paths
+    assert "test_invoice_worker.py" in file_paths
 
 
-# 4. Recent commits tool
-def test_recent_commits_tool():
-    res = get_recent_commits("scenario-invoice-field-rename", limit=3)
+# 8. Workspace Tool: search_code
+def test_tool_search_code():
+    res = search_code("sample-broken-invoice-project", query="customer_email")
     assert res["status"] == "success"
-    assert len(res["commits"]) >= 1
-    commit_hashes = [c["commit_id"] for c in res["commits"]]
-    assert "4f8a12d" in commit_hashes
+    assert res["total_matches"] >= 1
+    matching_files = [m["file"] for m in res["matches"]]
+    assert "invoice_worker.py" in matching_files
 
 
-# 5. Workflow definition tool
-def test_workflow_definition_tool():
-    res = get_workflow_definition("scenario-invoice-field-rename")
+# 9. Workspace Tool: read_file & path traversal block
+def test_tool_read_file_and_traversal_block():
+    # Valid read
+    res = read_file("sample-broken-invoice-project", "customer_service.py", start_line=1, end_line=5)
     assert res["status"] == "success"
-    assert res["workflow_id"] == "wf-invoice-gen-v2"
-    steps = res["steps"]
-    assert len(steps) == 4
-    step_3 = next(s for s in steps if s["step_id"] == "step_3")
-    assert step_3["expected_field"] == "customer_email"
+    assert res["start_line"] == 1
+    assert "CustomerService" in res["content"]
+
+    # Block path traversal
+    bad_res = read_file("sample-broken-invoice-project", "../../etc/passwd")
+    assert bad_res["status"] == "error"
+    assert "Path traversal detected" in bad_res["error"]
 
 
-# 6. Dependency information tool
-def test_dependency_info_tool():
-    res = get_dependency_info("scenario-invoice-field-rename")
+# 10. Workspace Tool: inspect_dependencies
+def test_tool_inspect_dependencies():
+    res = inspect_dependencies("sample-broken-invoice-project")
     assert res["status"] == "success"
-    assert res["workflow_id"] == "wf-invoice-gen-v2"
-    contracts = res["field_contracts"]
-    assert len(contracts) > 0
-    assert contracts[0]["field_name"] == "customer_email"
+    assert "requirements.txt" in res["manifests_found"]
+    assert any("pytest" in req for req in res["dependencies"]["requirements.txt"])
 
 
-# 7. Commit inspection tool
-def test_inspect_commit_tool():
-    res = inspect_commit("scenario-invoice-field-rename", "4f8a12d")
+# 11. Workspace Tool: discover_tests_and_commands
+def test_tool_discover_tests_and_commands():
+    res = discover_tests_and_commands("sample-broken-invoice-project")
     assert res["status"] == "success"
-    assert res["commit_id"] == "4f8a12d"
-    assert "services/customer/api.py" in res["file"]
-    assert "-        \"customer_email\": customer.email," in res["diff"]
-    assert "+        \"email\": customer.email," in res["diff"]
+    assert res["test_framework"] == "pytest"
+    assert "test_invoice_worker.py" in res["test_files"]
 
 
-# 8. Invalid tool arguments
-def test_invalid_tool_arguments():
-    # Non-existent scenario
-    res_bad_scenario = get_failure_details("non-existent-scenario")
-    assert "error" in res_bad_scenario
-
-    # Invalid empty arguments
-    res_empty = get_failure_details("")
-    assert "error" in res_empty
-
-    # Unknown commit
-    res_bad_commit = inspect_commit("scenario-invoice-field-rename", "unknown_hash_999")
-    assert res_bad_commit["status"] == "error"
+# 12. Workspace Tool: run_tests (baseline fails before fix)
+def test_tool_run_tests_baseline_fails():
+    res = run_tests("sample-broken-invoice-project")
+    assert res["status"] == "success"
+    assert res["passed"] is False
+    assert res["exit_code"] != 0
+    # Must capture the actual KeyError failure
+    assert "KeyError" in res["output"]
+    assert "customer_email" in res["output"]
 
 
-# 9. Agent iteration limit
-def test_agent_iteration_limit():
-    orchestrator = AgentOrchestrator()
-    orchestrator.max_iterations = 2
-    orchestrator.max_tool_calls = 10
+# 13. Workspace Tool: edit_file (applies real repair to source code)
+def test_tool_edit_file():
+    proj_id = "sample-broken-invoice-project"
+    # The defect is that invoice_worker expects 'customer_email', but customer_service returned 'email'
+    target = "recipient_email = profile['customer_email']"
+    replacement = "recipient_email = profile.get('customer_email') or profile.get('email')"
 
-    # Mock Gemini client to simulate an infinite tool-calling loop
-    with patch("backend.app.services.agent.agent_service.genai.Client") as mock_client_cls:
-        mock_client = MagicMock()
-        mock_chat = MagicMock()
-        mock_client.chats.create.return_value = mock_chat
+    edit_res = edit_file(proj_id, "invoice_worker.py", target=target, replacement=replacement)
+    assert edit_res["status"] == "success"
 
-        # Model repeatedly asks for get_failure_details
-        mock_call = MagicMock()
-        mock_call.name = "get_failure_details"
-        mock_call.args = {"scenario_id": "scenario-invoice-field-rename"}
-
-        mock_resp = MagicMock()
-        mock_resp.function_calls = [mock_call]
-        mock_chat.send_message.return_value = mock_resp
-
-        mock_client_cls.return_value = mock_client
-
-        with patch.object(settings, "gemini_api_key", "test_key_fake"):
-            report, events, _ = orchestrator._run_gemini_agent_loop(
-                investigation_id="INV-TEST-LIMIT",
-                scenario_id="scenario-invoice-field-rename",
-                scenario=get_scenario("scenario-invoice-field-rename")
-            )
-            # Must stop gracefully at max_iterations
-            assert report is not None
-            tool_call_events = [e for e in events if e.type == "tool_call"]
-            assert len(tool_call_events) <= 2
+    # Read back to verify modification on disk
+    read_back = read_file(proj_id, "invoice_worker.py")
+    assert replacement in read_back["content"]
 
 
-# 10. Tool-call limit
-def test_tool_call_limit():
-    orchestrator = AgentOrchestrator()
-    orchestrator.max_iterations = 10
-    orchestrator.max_tool_calls = 1
+# 14. Workspace Tool: run_tests (passes after fix!)
+def test_tool_run_tests_passes_after_repair():
+    proj_id = "sample-broken-invoice-project"
+    # Apply fix
+    target = "recipient_email = profile['customer_email']"
+    replacement = "recipient_email = profile.get('customer_email') or profile.get('email')"
+    edit_file(proj_id, "invoice_worker.py", target=target, replacement=replacement)
 
-    with patch("backend.app.services.agent.agent_service.genai.Client") as mock_client_cls:
-        mock_client = MagicMock()
-        mock_chat = MagicMock()
-        mock_client.chats.create.return_value = mock_chat
-
-        mock_call = MagicMock()
-        mock_call.name = "get_failure_details"
-        mock_call.args = {"scenario_id": "scenario-invoice-field-rename"}
-
-        mock_resp = MagicMock()
-        mock_resp.function_calls = [mock_call]
-        mock_chat.send_message.return_value = mock_resp
-
-        mock_client_cls.return_value = mock_client
-
-        with patch.object(settings, "gemini_api_key", "test_key_fake"):
-            report, events, _ = orchestrator._run_gemini_agent_loop(
-                investigation_id="INV-TEST-TOOL-LIMIT",
-                scenario_id="scenario-invoice-field-rename",
-                scenario=get_scenario("scenario-invoice-field-rename")
-            )
-            assert report is not None
-            tool_call_events = [e for e in events if e.type == "tool_call"]
-            assert len(tool_call_events) <= 1
+    # Re-run real tests
+    test_res = run_tests(proj_id)
+    assert test_res["status"] == "success"
+    assert test_res["passed"] is True
+    assert test_res["exit_code"] == 0
+    assert "2 passed" in test_res["output"]
 
 
-# 11. Invalid model-generated data (e.g., model requests a non-existent tool name)
-def test_invalid_model_generated_data():
-    orchestrator = AgentOrchestrator()
+# 15. Workspace Tool: get_workspace_diff
+def test_tool_get_workspace_diff():
+    proj_id = "sample-broken-invoice-project"
+    target = "recipient_email = profile['customer_email']"
+    replacement = "recipient_email = profile.get('customer_email') or profile.get('email')"
+    edit_file(proj_id, "invoice_worker.py", target=target, replacement=replacement)
 
-    with patch("backend.app.services.agent.agent_service.genai.Client") as mock_client_cls:
-        mock_client = MagicMock()
-        mock_chat = MagicMock()
-        mock_client.chats.create.return_value = mock_chat
-
-        mock_bad_call = MagicMock()
-        mock_bad_call.name = "execute_arbitrary_shell_command"
-        mock_bad_call.args = {"cmd": "rm -rf /"}
-
-        mock_resp_1 = MagicMock()
-        mock_resp_1.function_calls = [mock_bad_call]
-        mock_resp_2 = MagicMock()
-        mock_resp_2.function_calls = []
-
-        mock_chat.send_message.side_effect = [mock_resp_1, mock_resp_2]
-        mock_client_cls.return_value = mock_client
-
-        with patch.object(settings, "gemini_api_key", "test_key_fake"):
-            report, events, _ = orchestrator._run_gemini_agent_loop(
-                investigation_id="INV-BAD-DATA",
-                scenario_id="scenario-invoice-field-rename",
-                scenario=get_scenario("scenario-invoice-field-rename")
-            )
-            # Backend safely refused unknown tool call and recorded error result
-            result_events = [e for e in events if e.type == "tool_result"]
-            assert any("Unknown tool" in str(e.tool_result) for e in result_events)
+    diff_res = get_workspace_diff(proj_id)
+    assert diff_res["status"] == "success"
+    assert "invoice_worker.py" in diff_res["changed_files"]
+    assert "-    recipient_email = profile['customer_email']" in diff_res["diff"]
+    assert "+    recipient_email = profile.get('customer_email') or profile.get('email')" in diff_res["diff"]
 
 
-# 12. Missing Gemini configuration
-def test_missing_gemini_configuration():
+# 16. Workspace Tool: revert_file
+def test_tool_revert_file():
+    proj_id = "sample-broken-invoice-project"
+    target = "recipient_email = profile['customer_email']"
+    replacement = "recipient_email = 'HARDCODED_EMAIL'"
+    edit_file(proj_id, "invoice_worker.py", target=target, replacement=replacement)
+
+    revert_res = revert_file(proj_id, "invoice_worker.py")
+    assert revert_res["status"] == "success"
+
+    read_back = read_file(proj_id, "invoice_worker.py")
+    assert "recipient_email = profile['customer_email']" in read_back["content"]
+
+
+# 17. Agent: Missing API key returns explicit error (NO simulation fallback)
+def test_agent_missing_api_key_explicit_error():
     orchestrator = AgentOrchestrator()
     with patch.object(settings, "gemini_api_key", None):
-        report, events = orchestrator.run_investigation(
-            investigation_id="INV-NO-KEY",
-            scenario_id="scenario-invoice-field-rename"
-        )
-        assert report.mode == "DETERMINISTIC DEMO MODE"
-        assert report.status == "completed"
-        assert len(events) > 0
-        assert not any(e.is_gemini_native for e in events)
-
-
-# 13. Gemini API failure handling
-def test_gemini_api_failure_handling():
-    orchestrator = AgentOrchestrator()
-    with patch("backend.app.services.agent.agent_service.genai.Client", side_effect=Exception("ResourceExhausted: 429 Quota Exceeded")):
-        with patch.object(settings, "gemini_api_key", "valid_looking_key"):
-            report, events = orchestrator.run_investigation(
-                investigation_id="INV-QUOTA-FAIL",
-                scenario_id="scenario-invoice-field-rename"
+        with pytest.raises(ValueError) as excinfo:
+            orchestrator.run_project_investigation(
+                investigation_id="INV-NO-KEY",
+                project_id="sample-broken-invoice-project"
             )
-            assert report.mode == "DETERMINISTIC DEMO MODE"
-            # Recorded fallback event
-            error_events = [e for e in events if e.type == "error"]
-            assert len(error_events) >= 1
-            assert "DETERMINISTIC DEMO MODE" in error_events[0].message
+        assert "Gemini API key is not configured" in str(excinfo.value)
+        assert "Automatic simulation fallback has been disabled" in str(excinfo.value)
 
 
-# 14. Evidence reference validation
-def test_evidence_reference_validation():
-    scenario = get_scenario("scenario-invoice-field-rename")
+# 18. API Endpoint: Missing API key returns HTTP 400 Bad Request
+def test_api_missing_api_key_returns_400(client):
+    with patch.object(settings, "gemini_api_key", None):
+        resp = client.post(
+            "/api/investigations",
+            json={"project_id": "sample-broken-invoice-project"}
+        )
+        assert resp.status_code == 400
+        assert "Gemini API key is not configured" in resp.json()["detail"]
+
+
+# 19. Agent Mocked Tool-Calling Loop with Real Workspace Repair
+def test_agent_mock_tool_loop_executes_real_repair():
     orchestrator = AgentOrchestrator()
-    report, _ = orchestrator.run_investigation(
-        investigation_id="INV-EVID-VAL",
-        scenario_id="scenario-invoice-field-rename",
-        force_deterministic=True
+    proj_id = "sample-broken-invoice-project"
+
+    with patch("backend.app.services.agent.agent_service.genai.Client") as mock_client_cls:
+        mock_client = MagicMock()
+        mock_chat = MagicMock()
+        mock_client.chats.create.return_value = mock_chat
+
+        # Turn 1: Model calls run_tests
+        call_1 = MagicMock()
+        call_1.name = "run_tests"
+        call_1.args = {"project_id": proj_id}
+        resp_1 = MagicMock()
+        resp_1.function_calls = [call_1]
+
+        # Turn 2: Model calls edit_file to fix KeyError
+        call_2 = MagicMock()
+        call_2.name = "edit_file"
+        call_2.args = {
+            "project_id": proj_id,
+            "file_path": "invoice_worker.py",
+            "target": "recipient_email = profile['customer_email']",
+            "replacement": "recipient_email = profile.get('customer_email') or profile.get('email')"
+        }
+        resp_2 = MagicMock()
+        resp_2.function_calls = [call_2]
+
+        # Turn 3: Model calls run_tests again to verify
+        call_3 = MagicMock()
+        call_3.name = "run_tests"
+        call_3.args = {"project_id": proj_id}
+        resp_3 = MagicMock()
+        resp_3.function_calls = [call_3]
+
+        # Turn 4: Model finishes
+        resp_4 = MagicMock()
+        resp_4.function_calls = []
+        resp_4.text = "Fixed KeyError by reading email key from profile payload. Verified all tests pass."
+
+        mock_chat.send_message.side_effect = [resp_1, resp_2, resp_3, resp_4]
+        mock_client_cls.return_value = mock_client
+
+        with patch.object(settings, "gemini_api_key", "test_key_live"):
+            report, events = orchestrator.run_project_investigation(
+                investigation_id="INV-MOCK-LIVE",
+                project_id=proj_id
+            )
+
+            # Verification must be REAL and passed!
+            assert report.status == "completed"
+            assert report.verification.status == "passed"
+            assert report.verification.simulated is False
+            assert "REAL VERIFICATION" in report.verification.notice
+            assert report.verification.exit_code == 0
+            assert "invoice_worker.py" in report.changed_files
+            assert report.diff is not None
+            assert len(events) >= 5
+
+
+# 20. Project Graph Generation
+def test_project_graph_generation():
+    graph = CausalGraphEngine.build_graph_for_project(
+        project_id="sample-broken-invoice-project",
+        changed_files=["invoice_worker.py"],
+        test_passed=True
     )
-    evidence_ids = {e.id for e in report.evidence}
-    # Check that root cause references existing evidence
-    for ref_id in report.root_cause.evidence_ids:
-        assert ref_id in evidence_ids, f"Referenced evidence ID {ref_id} must exist in report evidence list"
+    assert len(graph.nodes) >= 4
+    assert len(graph.edges) >= 3
 
-
-# 15. Graph construction
-def test_graph_construction():
-    graph = CausalGraphEngine.build_graph_for_scenario("scenario-invoice-field-rename")
-    assert len(graph.nodes) == 4
-    assert len(graph.edges) == 3
-
-    node_types = {n.data.component_type for n in graph.nodes}
-    assert "commit" in node_types
-    assert "api_schema" in node_types
-    assert "workflow_step" in node_types
-    assert "failure" in node_types
-
-    edge_relationships = {e.relationship for e in graph.edges}
-    assert "modified" in edge_relationships
-    assert "incompatible_with" in edge_relationships
-    assert "contributed_to" in edge_relationships
-
-
-# 16. Missing graph node references (validation prevents disconnected / broken edge references)
-def test_missing_graph_node_references():
-    graph = CausalGraphEngine.build_graph_for_scenario("scenario-invoice-field-rename")
     node_ids = {n.id for n in graph.nodes}
-    for edge in graph.edges:
-        assert edge.source in node_ids, f"Edge source {edge.source} must exist in nodes"
-        assert edge.target in node_ids, f"Edge target {edge.target} must exist in nodes"
+    assert "node-source-file" in node_ids
+    assert "node-test-file" in node_ids
+    assert "node-failure-event" in node_ids
+    assert "node-repair-patch" in node_ids
 
 
-# 17. Simulated successful remediation
-def test_simulated_successful_remediation(client):
-    # Option A: Update workflow field mapping to 'email'
-    res = VerificationEngine.verify_remediation(
-        scenario_id="scenario-invoice-field-rename",
-        option_id="opt-workflow-update"
-    )
-    assert res.status == "passed"
-    assert res.simulated is True
-    assert "SIMULATED VERIFICATION" in res.notice
-    assert "successfully consumed field 'email'" in res.message
+# 21. Project Reset API endpoint
+def test_project_reset_endpoint(client):
+    proj_id = "sample-broken-invoice-project"
+    # Make a change
+    edit_file(proj_id, "invoice_worker.py", "recipient_email", "MODIFIED_TEXT")
+
+    # Reset via API
+    resp = client.post(f"/api/projects/{proj_id}/reset")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+
+    # Verify original file content is restored
+    read_back = read_file(proj_id, "invoice_worker.py")
+    assert "recipient_email = profile['customer_email']" in read_back["content"]
 
 
-# 18. Simulated unsuccessful remediation
-def test_simulated_unsuccessful_remediation(client):
-    # Option C: Restarting worker does not resolve schema field missing
-    res = VerificationEngine.verify_remediation(
-        scenario_id="scenario-invoice-field-rename",
-        option_id="opt-restart-worker"
-    )
-    assert res.status == "failed"
-    assert res.simulated is True
-    assert "recurred upon execution" in res.message
+# 22. End-to-End Project Workflow API Test
+def test_end_to_end_project_workflow_api(client):
+    # 1. Run baseline tests via API
+    test_resp = client.post("/api/projects/sample-broken-invoice-project/run-tests")
+    assert test_resp.status_code == 200
+    assert test_resp.json()["passed"] is False
 
+    # 2. Get initial diff (empty)
+    diff_resp = client.get("/api/projects/sample-broken-invoice-project/diff")
+    assert diff_resp.status_code == 200
+    assert diff_resp.json()["total_changed_files"] == 0
 
-# 19. Unresolved root-cause behavior (ambiguous scenario returns unconfirmed root cause)
-def test_unresolved_root_cause_behavior():
-    orchestrator = AgentOrchestrator()
-    report, _ = orchestrator.run_investigation(
-        investigation_id="INV-AMB",
-        scenario_id="scenario-ambiguous-timeout",
-        force_deterministic=True
-    )
-    assert report.status == "unresolved"
-    assert report.root_cause.status == "unconfirmed"
-    assert report.root_cause.confidence_label == "Unconfirmed / Insufficient Evidence"
-    assert len(report.remaining_unknowns) > 0
-
-
-# 20. Demo reset behavior
-def test_demo_reset_behavior(client):
-    # Start an investigation
-    resp = client.post(
-        "/api/investigations",
-        json={"scenario_id": "scenario-invoice-field-rename", "force_deterministic": True}
-    )
-    assert resp.status_code == 201
-    inv_id = resp.json()["investigation_id"]
-
-    # Mutate state by applying remediation
-    rem_resp = client.post(
-        f"/api/investigations/{inv_id}/remediation",
-        json={"option_id": "opt-workflow-update"}
-    )
-    assert rem_resp.status_code == 200
-    assert rem_resp.json()["verification"]["status"] == "passed"
-
-    # Reset demo
-    reset_resp = client.post("/api/demo/reset")
-    assert reset_resp.status_code == 200
-    assert reset_resp.json()["status"] == "success"
-
-    # Verify investigation record was cleared
-    get_resp = client.get(f"/api/investigations/{inv_id}")
-    assert get_resp.status_code == 404
-
-
-# 21. Tool argument aliasing (commit_hash, count, etc.)
-def test_tool_argument_aliases():
-    # Test commit_hash alias
-    res_commit = inspect_commit("scenario-invoice-field-rename", commit_hash="4f8a12d")
-    assert res_commit["status"] == "success"
-    assert res_commit["commit_id"] == "4f8a12d"
-
-    # Test sha alias
-    res_sha = inspect_commit("scenario-invoice-field-rename", sha="4f8a12d")
-    assert res_sha["status"] == "success"
-    assert res_sha["commit_id"] == "4f8a12d"
-
-    # Test count alias for limit
-    res_count = get_recent_commits("scenario-invoice-field-rename", count=2)
-    assert res_count["status"] == "success"
-    assert len(res_count["commits"]) == 2
-
-
-# 22. Evidence degradation when diff is unobserved
-def test_report_degradation_without_diff():
-    orchestrator = AgentOrchestrator()
-    scenario = get_scenario("scenario-invoice-field-rename")
-    # Only supply failure details without diff inspection
-    fail_res = get_failure_details("scenario-invoice-field-rename")
-    partial_evidence = orchestrator._extract_evidence_from_result("get_failure_details", {"scenario_id": "scenario-invoice-field-rename"}, fail_res)
-
-    report = orchestrator._construct_structured_report(
-        investigation_id="INV-DEGRADE-TEST",
-        scenario_id="scenario-invoice-field-rename",
-        scenario=scenario,
-        mode="AI AGENT MODE",
-        evidence_list=partial_evidence
+    # 3. Apply a real fix using edit_file tool
+    edit_file(
+        "sample-broken-invoice-project",
+        "invoice_worker.py",
+        "recipient_email = profile['customer_email']",
+        "recipient_email = profile.get('customer_email') or profile.get('email')"
     )
 
-    assert report.root_cause.confidence == 0.65
-    assert report.root_cause.confidence_label == "Moderate Assessment"
-    assert report.root_cause.status == "unconfirmed"
-    assert len(report.remaining_unknowns) > 0
-    # Supporting evidence IDs must match the observed evidence only
-    observed_ids = {e.id for e in partial_evidence}
-    for ref_id in report.root_cause.evidence_ids:
-        assert ref_id in observed_ids
+    # 4. Run tests again via API (must pass!)
+    test_resp_2 = client.post("/api/projects/sample-broken-invoice-project/run-tests")
+    assert test_resp_2.status_code == 200
+    assert test_resp_2.json()["passed"] is True
+    assert test_resp_2.json()["exit_code"] == 0
 
-
-# 23. Zero evidence handling
-def test_report_zero_evidence():
-    orchestrator = AgentOrchestrator()
-    scenario = get_scenario("scenario-invoice-field-rename")
-    report = orchestrator._construct_structured_report(
-        investigation_id="INV-ZERO-TEST",
-        scenario_id="scenario-invoice-field-rename",
-        scenario=scenario,
-        mode="AI AGENT MODE",
-        evidence_list=[]
-    )
-
-    assert report.status == "unresolved"
-    assert report.root_cause.confidence == 0.20
-    assert report.root_cause.confidence_label == "Unconfirmed / Insufficient Evidence"
-    assert report.root_cause.status == "unconfirmed"
-    assert report.root_cause.evidence_ids == []
-
-
-# 24. Verification engine edge cases
-def test_verifier_invalid_inputs():
-    # Invalid scenario
-    res_bad_scenario = VerificationEngine.verify_remediation("non-existent-scenario", "opt-1")
-    assert res_bad_scenario.status == "failed"
-    assert "not found" in res_bad_scenario.message
-
-    # Invalid option
-    res_bad_opt = VerificationEngine.verify_remediation("scenario-invoice-field-rename", "non-existent-option")
-    assert res_bad_opt.status == "failed"
-    assert "not recognized" in res_bad_opt.message
-
-
-# 25. End-to-end investigation API lifecycle
-def test_full_investigation_api_lifecycle(client):
-    # 1. Start investigation
-    start_resp = client.post(
-        "/api/investigations",
-        json={"scenario_id": "scenario-invoice-field-rename", "force_deterministic": True}
-    )
-    assert start_resp.status_code == 201
-    inv_id = start_resp.json()["investigation_id"]
-
-    # 2. Get events
-    events_resp = client.get(f"/api/investigations/{inv_id}/events")
-    assert events_resp.status_code == 200
-    events = events_resp.json()
-    assert len(events) >= 5
-
-    # 3. Get causal graph
-    graph_resp = client.get(f"/api/investigations/{inv_id}/graph")
-    assert graph_resp.status_code == 200
-    graph = graph_resp.json()
-    assert len(graph["nodes"]) >= 4
-    assert len(graph["edges"]) >= 3
-
-    # 4. Get report
-    report_resp = client.get(f"/api/investigations/{inv_id}/report")
-    assert report_resp.status_code == 200
-    report = report_resp.json()
-    assert report["status"] == "completed"
-    assert report["root_cause"]["status"] == "probable"
-
-    # 5. Apply remediation
-    rem_resp = client.post(
-        f"/api/investigations/{inv_id}/remediation",
-        json={"option_id": "opt-workflow-update"}
-    )
-    assert rem_resp.status_code == 200
-    assert rem_resp.json()["verification"]["status"] == "passed"
-
-    # 6. Verify investigation endpoint
-    verify_resp = client.post(f"/api/investigations/{inv_id}/verify")
-    assert verify_resp.status_code == 200
-    assert verify_resp.json()["status"] == "passed"
-
+    # 5. Get diff via API (shows unified diff of the fix)
+    diff_resp_2 = client.get("/api/projects/sample-broken-invoice-project/diff")
+    assert diff_resp_2.status_code == 200
+    assert diff_resp_2.json()["total_changed_files"] == 1
+    assert "invoice_worker.py" in diff_resp_2.json()["changed_files"]

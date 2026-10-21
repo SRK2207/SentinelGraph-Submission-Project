@@ -1,25 +1,52 @@
 # SentinelGraph
 
-> *"A change happened here. Something broke there. SentinelGraph investigates why."*
+> *"A change happened here. Something broke there. SentinelGraph investigates and fixes it."*
 
-**SentinelGraph** is an agentic AI-powered cross-system workflow failure investigation and root-cause analysis platform built for **Hackloop 2026**.
+**SentinelGraph** is an autonomous AI-powered software project failure investigation and automated code repair agent built for **Hackloop 2026**.
 
-When a change in one system (such as an API response field rename or a database schema alteration) silently breaks a dependent automation workflow elsewhere, developers typically spend hours inspecting disparate Git logs, API responses, dependency relationships, and workflow configurations.
+Modern software systems frequently suffer cross-system contract regressions — for example, when an API refactoring renames a response key from `customer_email` to `email`, silently breaking downstream billing workers and failing automation tests.
 
-SentinelGraph solves this problem by autonomously investigating the failure, collecting verifiable evidence across systems, evaluating competing hypotheses, constructing a directed causal graph, generating actionable remediations, and running simulated verifications.
+Instead of developers manually combing through error logs, test failure traces, imported dependencies, and Git histories, SentinelGraph:
+1. **Safely Ingests Project Archives**: Accepts `.zip` software project uploads into dedicated, isolated filesystem sandboxes with strict path-traversal safeguards.
+2. **Autonomously Discovers & Runs Real Tests**: Discovers test suites (`pytest`, `unittest`, `npm test`), executes them in sandboxed subprocesses, and observes actual exit codes and error traces.
+3. **Explores Real Codebases with Dynamic Tools**: Inspects failing assertions, reads source files, searches definitions across the workspace, and identifies the root-cause defect.
+4. **Applies Targeted Code Patches**: Directly modifies source files within the isolated working directory.
+5. **Performs Real Verification**: Re-runs the project's real test suite to prove that all tests pass before and after the repair, generating real unified diffs and execution logs.
+6. **Zero Synthetic Simulations**: Real file operations and real test runner executions. If `GEMINI_API_KEY` is not provided, the system returns an explicit error rather than fabricating fake investigation traces.
 
 ---
 
-## Key Features
+## Architecture & Capabilities
 
-1. **Autonomous Tool Selection**: Leverages native Gemini function calling. The agent inspects incident failure details, decides what information is missing, dynamically executes registered investigation tools, and observes returned evidence.
-2. **Strict Evidence Provenance**: Every claim, hypothesis, causal edge, and remediation is linked to verifiable evidence IDs (`EVID-...`) captured from synthetic repository diffs, contracts, and workflow definitions.
-3. **Interactive Causal Dependency Graph**: Built with **NetworkX** on the backend and rendered with **React Flow** on the frontend. Visually distinguishes confirmed facts, probable causes, affected components, and unverified hypotheses.
-4. **Honest Uncertainty Handling**: When evidence is insufficient (e.g. external network timeouts unrelated to repository commits), SentinelGraph reports root causes as unconfirmed and identifies remaining unknowns rather than hallucinating causes.
-5. **Interactive Remediation & Simulated Verification**: Select proposed remediations and execute simulated verifications against controlled synthetic state.
-6. **Two Distinct Operating Modes**:
-   - **AI AGENT MODE**: Uses live Gemini API tool calling with your Google AI Studio API key.
-   - **DETERMINISTIC DEMO MODE**: Works 100% offline without requiring an API key, executing the identical investigation trace for seamless demonstration.
+```
++---------------------------------------------------------------------------------+
+|                                SentinelGraph UI                                 |
+|  - ZIP Upload & Project Library     - Live Tool Call Execution Stream           |
+|  - Interactive NetworkX Causal DAG   - Real Unified Patch Diff Viewer            |
+|  - Real Test Execution Terminal Logs - One-Click Sample Defective Project Demo  |
++---------------------------------------------------------------------------------+
+                                       | (REST API)
++---------------------------------------------------------------------------------+
+|                                FastAPI Backend                                  |
+|  - /api/projects/upload   : Path-traversal safe zip extraction                  |
+|  - /api/projects/sample   : Built-in broken invoice microservice with tests     |
+|  - /api/projects/run-tests: Real subprocess pytest / test runner execution      |
+|  - /api/projects/diff     : difflib unified diff between original & current src |
+|  - /api/investigations    : Live Gemini Agent orchestration & repair loop       |
++---------------------------------------------------------------------------------+
+         |                                                 |
+         v                                                 v
++-----------------------------+               +-----------------------------------+
+|     Google Gemini Agent     |               |    Isolated Workspace Sandbox     |
+| - list_project_files        |  <--------->  | backend/workspaces/<project_id>/  |
+| - search_code               |               |   ├── original/ (pristine backup) |
+| - read_file                 |               |   └── src/      (working copy)    |
+| - discover_tests_and_commands|              | Safe path resolution, subprocess  |
+| - run_tests (subprocess)    |               | test execution, and targeted code |
+| - edit_file (real patching) |               | modification.                     |
+| - get_workspace_diff        |               +-----------------------------------+
++-----------------------------+
+```
 
 ---
 
@@ -28,46 +55,36 @@ SentinelGraph solves this problem by autonomously investigating the failure, col
 - **Frontend**:
   - Next.js 14 (App Router)
   - React 18 & TypeScript
-  - Tailwind CSS (Deep Navy/Charcoal Dark Developer-Tool Interface)
-  - React Flow (`@xyflow/react`) for interactive causal graphs
+  - Tailwind CSS (Deep Navy/Charcoal Dark Developer Interface)
+  - React Flow (`@xyflow/react`) for interactive causal DAGs
   - Lucide React icons
 - **Backend**:
   - Python 3.12+
   - FastAPI & Uvicorn
-  - Pydantic v2 (Validation & Schemas)
+  - Pydantic v2 (Strict Schema Validation)
   - Google GenAI SDK (`google-genai` 2.x)
   - NetworkX 3.x (Graph Theory & Directed DAGs)
   - Pytest & HTTPX (Automated Test Suite)
-- **Data**:
-  - Local synthetic JSON fixtures representing multi-system states
-
----
-
-## Prerequisites
-
-- **Python**: 3.10+ (Tested on Python 3.12)
-- **Node.js**: v18+ (Tested on Node v24)
-- **npm**: 9+
-- **Google AI Studio API Key** *(Optional)*: Required for live Gemini Agent Mode; if omitted, the application runs in Deterministic Demo Mode.
+  - Python Multipart (Secure Archive Uploads)
 
 ---
 
 ## Installation & Setup
 
-### 1. Repository Directory
+### 1. Clone & Enter Repository
 ```bash
 cd sentinelgraph-submission
 ```
 
 ### 2. Backend Setup
 Create a Python virtual environment and install dependencies:
-```bash
+```powershell
 # Create virtual environment
 python -m venv backend/venv
 
 # Activate virtual environment (Windows PowerShell)
 .\backend\venv\Scripts\Activate.ps1
-# (Or on macOS/Linux: source backend/venv/bin/activate)
+# (Or macOS/Linux: source backend/venv/bin/activate)
 
 # Install dependencies
 pip install -r backend/requirements.txt
@@ -94,7 +111,7 @@ MAX_AGENT_ITERATIONS=8
 MAX_TOOL_CALLS=12
 ```
 
-> **Note**: If `GEMINI_API_KEY` is left blank, SentinelGraph runs in **DETERMINISTIC DEMO MODE**.
+> **Note**: A valid `GEMINI_API_KEY` is required for live AI agent investigations. If left blank, the application explicitly reports that an API key is required, preventing fabricated or simulated fallback results.
 
 ### 4. Frontend Setup
 ```bash
@@ -108,8 +125,8 @@ npm install
 
 ### 1. Start the FastAPI Backend
 From the workspace root:
-```bash
-backend\venv\Scripts\uvicorn.exe backend.app.main:app --host 127.0.0.1 --port 8000 --reload
+```powershell
+.\backend\venv\Scripts\uvicorn.exe backend.app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 The backend starts at `http://127.0.0.1:8000`. You can inspect the interactive OpenAPI documentation at `http://127.0.0.1:8000/docs`.
 
@@ -125,55 +142,30 @@ Open your browser at `http://localhost:3000`.
 
 ## Running Automated Backend Tests
 
-The project includes an automated test suite covering 25 comprehensive backend test cases:
-```bash
-backend\venv\Scripts\pytest.exe backend\app\tests\test_backend.py -v
+The project includes an automated test suite with **22 passing test cases** verifying real workspace extraction, security, subprocess test execution, file editing, and agent dispatch:
+```powershell
+.\backend\venv\Scripts\pytest.exe backend\app\tests\test_backend.py -v
 ```
 
-All 25 tests verify:
-- Health and scenario endpoints
-- All 5 investigation tools (`get_failure_details`, `get_recent_commits`, `get_workflow_definition`, `get_dependency_info`, `inspect_commit`)
-- Tool argument aliasing (e.g., `commit_hash`, `sha`, `count`)
-- Argument and payload validation
-- Agent iteration and tool-call safety limits
-- Missing API key & Gemini error fallbacks
-- Evidence provenance integrity & zero-evidence degradation
-- Uncertainty handling & confidence reduction when code diffs are unobserved
-- NetworkX graph construction and edge validation
-- Simulated successful and unsuccessful remediations
-- Verifier edge cases and error handling
-- End-to-end investigation API lifecycle
-- Demo reset behavior
+All 22 tests verify:
+- Health, dashboard, and connection endpoints
+- Safe ZIP extraction and strict rejection of path traversal attempts (`../../evil.txt`)
+- Project workspace file listing, code search, and bounded file reading
+- Dependency manifest discovery (`requirements.txt`, `pyproject.toml`, `package.json`)
+- Subprocess test execution capturing real test failures (`KeyError: 'customer_email'`)
+- Targeted file editing and real file modification in the isolated workspace
+- Re-executing real tests to confirm they PASS after repair (`exit_code == 0`)
+- Generating real unified diffs comparing original and patched files
+- File reversion and project reset back to original uploaded snapshots
+- Explicit error handling when `GEMINI_API_KEY` is missing (no simulated fallback)
+- Mocked Gemini tool-calling loop verifying real project repair and test validation
+- End-to-end project workflow API integration
 
 ---
 
-## Demonstration Scenarios
+## Security & Isolation Safeguards
 
-1. **Invoice Workflow Failure — Backend Field Rename (Primary Demo)**
-   - **Context**: A developer refactored the customer profile API response in commit `4f8a12d`, renaming field `customer_email` to `email`.
-   - **Failure**: The invoice automation workflow (`wf-invoice-gen-v2`) failed with `KeyError: 'customer_email'`.
-   - **Investigation**: SentinelGraph autonomously queries failure details, discovers recent commits, inspects the git diff, checks workflow definitions, builds a causal chain, and recommends updating the workflow field mapping or adding a backward-compatible alias.
-   - **Verification**: Selecting a remediation simulates the fix and verifies resolution.
-
-2. **Payment Reconciliation Timeout — Ambiguous Cause (Uncertainty Test)**
-   - **Context**: Daily payment reconciliation failed due to an external gateway timeout after 30s.
-   - **Investigation**: Recent code commits only touched documentation and CSS.
-   - **Result**: SentinelGraph explicitly reports the root cause as **UNCONFIRMED / INSUFFICIENT EVIDENCE** and lists remaining unknowns rather than hallucinating an internal code cause.
-
----
-
-## Documentation
-
-- [Architecture Guide](docs/ARCHITECTURE.md): System design, agent tool-calling loop, NetworkX graph engine, and evidence provenance model.
-- [API Reference](docs/API.md): Full documentation of all REST endpoints, request/response models, and error behaviors.
-- [Demonstration Guide](docs/DEMO_GUIDE.md): 5-minute step-by-step walkthrough script for teammates, mentors, and hackathon judges.
-
----
-
-## Security & Transparency Notes
-
-- **API Key Security**: The Gemini API key remains strictly on the backend and is never exposed to the browser or returned in API responses.
-- **Controlled Execution**: The AI agent cannot execute arbitrary shell commands, access arbitrary local disk paths, or modify external code.
-- **Simulated Verification Notice**: All verification actions operate purely on synthetic in-memory fixtures and carry the label:
-  `"SIMULATED VERIFICATION — NO REAL WORKFLOW EXECUTED"`.
-- **Honest Mode Signaling**: The application visibly displays whether it is running in `AI AGENT MODE` or `DETERMINISTIC DEMO MODE`. Fallback runs are never misrepresented.
+1. **Path-Traversal Protection**: All archive extractions and filesystem tool calls (`read_file`, `write_file`, `edit_file`) validate that resolved paths strictly reside within the isolated workspace `src/` directory. Any attempt to navigate with `..` or absolute paths is rejected with `WorkspaceSecurityError`.
+2. **Subprocess Isolation**: Tests run in an isolated subprocess with the working directory strictly set to the workspace's `src/` directory and `PYTHONDONTWRITEBYTECODE=1`. Command execution is protected by a strict 25-second timeout to prevent runaway processes.
+3. **Preserved Original Snapshots**: Every project workspace maintains an immutable `original/` copy of the uploaded files, allowing instant rollback and verifiable unified diff generation.
+4. **Credential Security**: `GEMINI_API_KEY` remains strictly on the backend. Frontend code never receives or exposes API credentials.

@@ -4,7 +4,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { Navbar } from "@/components/layout/Navbar";
 import { DashboardView } from "@/components/dashboard/DashboardView";
 import { ConnectionsView } from "@/components/connections/ConnectionsView";
-import { ScenarioSelectView } from "@/components/investigation/ScenarioSelectView";
+import { ProjectUploadView } from "@/components/investigation/ProjectUploadView";
 import { LiveWorkspaceView } from "@/components/investigation/LiveWorkspaceView";
 import { CausalGraphView } from "@/components/graph/CausalGraphView";
 import { ReportView } from "@/components/reports/ReportView";
@@ -13,19 +13,21 @@ import {
   HealthStatus,
   DashboardStats,
   ConnectionStatus,
-  ScenarioOverview,
   InvestigationReport,
   InvestigationEvent,
   GraphData,
+  ProjectOverview,
+  TestRunResult,
 } from "@/types";
-import { AlertCircle, X } from "lucide-react";
+import { AlertCircle, X, CheckCircle2 } from "lucide-react";
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<string>("dashboard");
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [dashboardStats, setDashboardStats] = useState<DashboardStats | null>(null);
   const [connections, setConnections] = useState<ConnectionStatus[]>([]);
-  const [scenarios, setScenarios] = useState<ScenarioOverview[]>([]);
+  const [projects, setProjects] = useState<ProjectOverview[]>([]);
+  const [selectedProject, setSelectedProject] = useState<ProjectOverview | null>(null);
 
   // Active investigation state
   const [activeInvestigationId, setActiveInvestigationId] = useState<string | null>(null);
@@ -33,32 +35,36 @@ export default function Home() {
   const [activeEvents, setActiveEvents] = useState<InvestigationEvent[]>([]);
   const [activeGraph, setActiveGraph] = useState<GraphData | null>(null);
 
-  // Loading & status flags
+  // Status flags
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isVerifying, setIsVerifying] = useState<boolean>(false);
   const [isResetting, setIsResetting] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  // Initial load
+  // Load initial backend state and projects
   const loadInitialData = useCallback(async () => {
     try {
-      const [h, d, c, s] = await Promise.all([
+      const [h, d, c, pList] = await Promise.all([
         api.getHealth(),
         api.getDashboard(),
         api.getConnections(),
-        api.getScenarios(),
+        api.getProjects(),
       ]);
       setHealth(h);
       setDashboardStats(d);
       setConnections(c);
-      setScenarios(s);
+      setProjects(pList);
+      if (pList.length > 0 && !selectedProject) {
+        setSelectedProject(pList[0]);
+      }
     } catch (err: any) {
-      console.warn("Backend not yet connected or initial load failed:", err);
+      console.warn("Backend not yet connected:", err);
       setErrorMessage(
         "Could not connect to FastAPI backend at http://localhost:8000. Ensure the backend server is running."
       );
     }
-  }, []);
+  }, [selectedProject]);
 
   useEffect(() => {
     loadInitialData();
@@ -88,24 +94,65 @@ export default function Home() {
     }
   };
 
-  // Launch a new investigation
+  // Upload Project ZIP
+  const handleUploadZip = async (file: File) => {
+    setErrorMessage(null);
+    try {
+      const uploaded = await api.uploadProject(file);
+      setProjects((prev) => [uploaded, ...prev]);
+      setSelectedProject(uploaded);
+      setSuccessMessage(`Successfully extracted '${uploaded.name}' (${uploaded.file_count} files) into isolated workspace.`);
+      setTimeout(() => setSuccessMessage(null), 4000);
+    } catch (err: any) {
+      setErrorMessage(err.message);
+    }
+  };
+
+  // Load sample project
+  const handleLoadSample = async () => {
+    setErrorMessage(null);
+    try {
+      const sample = await api.createSampleProject();
+      setProjects((prev) => {
+        const filtered = prev.filter((p) => p.project_id !== sample.project_id);
+        return [sample, ...filtered];
+      });
+      setSelectedProject(sample);
+      setSuccessMessage("Loaded demo broken invoice service with test suite. Ready for autonomous repair.");
+      setTimeout(() => setSuccessMessage(null), 4000);
+    } catch (err: any) {
+      setErrorMessage(err.message);
+    }
+  };
+
+  // Run baseline tests in workspace
+  const handleRunTests = async (projectId: string): Promise<TestRunResult | null> => {
+    try {
+      return await api.runProjectTests(projectId);
+    } catch (err: any) {
+      setErrorMessage(`Failed to run tests: ${err.message}`);
+      return null;
+    }
+  };
+
+  // Launch AI investigation and repair
   const handleLaunchInvestigation = async (
-    scenarioId: string,
-    forceDeterministic: boolean
+    projectId: string,
+    issueDescription?: string
   ) => {
     try {
       setIsLoading(true);
       setErrorMessage(null);
-      const launchRes = await api.startInvestigation(scenarioId, forceDeterministic);
+      const launchRes = await api.startInvestigation(projectId, issueDescription);
       await loadInvestigation(launchRes.investigation_id, "workspace");
     } catch (err: any) {
-      setErrorMessage(`Investigation launch failed: ${err.message}`);
+      setErrorMessage(`Investigation failed: ${err.message}`);
     } finally {
       setIsLoading(false);
     }
   };
 
-  // Apply remediation option
+  // Apply remediation
   const handleApplyRemediation = async (optionId: string) => {
     if (!activeInvestigationId) return;
     try {
@@ -116,7 +163,7 @@ export default function Home() {
     }
   };
 
-  // Verify remediation
+  // Verify remediation by executing tests
   const handleVerify = async () => {
     if (!activeInvestigationId) return;
     try {
@@ -135,8 +182,8 @@ export default function Home() {
     }
   };
 
-  // Reset demonstration state
-  const handleResetDemo = async () => {
+  // Reset workspace
+  const handleResetWorkspace = async () => {
     try {
       setIsResetting(true);
       await api.resetDemo();
@@ -146,8 +193,10 @@ export default function Home() {
       setActiveGraph(null);
       await loadInitialData();
       setActiveTab("dashboard");
+      setSuccessMessage("Workspace snapshots reset to original uploaded states.");
+      setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err: any) {
-      setErrorMessage(`Failed to reset state: ${err.message}`);
+      setErrorMessage(`Failed to reset workspace: ${err.message}`);
     } finally {
       setIsResetting(false);
     }
@@ -159,7 +208,7 @@ export default function Home() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         health={health}
-        onResetDemo={handleResetDemo}
+        onResetDemo={handleResetWorkspace}
         isResetting={isResetting}
         hasActiveInvestigation={Boolean(activeReport)}
       />
@@ -172,10 +221,22 @@ export default function Home() {
               <AlertCircle className="h-4 w-4 text-rose-400 flex-shrink-0" />
               <span>{errorMessage}</span>
             </div>
-            <button
-              onClick={() => setErrorMessage(null)}
-              className="text-rose-400 hover:text-white"
-            >
+            <button onClick={() => setErrorMessage(null)} className="text-rose-400 hover:text-white">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Global Success Banner */}
+      {successMessage && (
+        <div className="mx-auto mt-4 max-w-7xl px-4 sm:px-6 w-full">
+          <div className="flex items-center justify-between rounded-lg bg-emerald-950/80 p-3 text-xs text-emerald-200 border border-emerald-800">
+            <div className="flex items-center space-x-2">
+              <CheckCircle2 className="h-4 w-4 text-emerald-400 flex-shrink-0" />
+              <span>{successMessage}</span>
+            </div>
+            <button onClick={() => setSuccessMessage(null)} className="text-emerald-400 hover:text-white">
               <X className="h-4 w-4" />
             </button>
           </div>
@@ -194,10 +255,15 @@ export default function Home() {
         )}
 
         {activeTab === "investigate" && (
-          <ScenarioSelectView
-            scenarios={scenarios}
+          <ProjectUploadView
             health={health}
+            projects={projects}
+            selectedProject={selectedProject}
+            onSelectProject={setSelectedProject}
+            onUploadZip={handleUploadZip}
+            onLoadSample={handleLoadSample}
             onLaunchInvestigation={handleLaunchInvestigation}
+            onRunTests={handleRunTests}
             isLoading={isLoading}
           />
         )}
@@ -236,13 +302,13 @@ export default function Home() {
       <footer className="border-t border-surface-border bg-surface/50 py-4 px-4 text-center text-[11px] text-slate-500">
         <div className="mx-auto max-w-7xl flex flex-col sm:flex-row items-center justify-between gap-2">
           <div>
-            SentinelGraph &copy; 2026 &middot; Autonomous Root-Cause Analysis
+            SentinelGraph &copy; 2026 &middot; Autonomous Software Project Investigation & Repair Agent
           </div>
           <div className="font-mono text-slate-400">
             Backend API: <span className="text-cyan-400">http://localhost:8000</span> &middot;
             Mode:{" "}
             <span className={health?.gemini_configured ? "text-emerald-400" : "text-amber-400"}>
-              {health?.mode || "DETERMINISTIC DEMO MODE"}
+              {health?.mode || "API KEY REQUIRED"}
             </span>
           </div>
         </div>

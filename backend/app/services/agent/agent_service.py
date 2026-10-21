@@ -6,14 +6,19 @@ from google import genai
 from google.genai import types
 
 from backend.app.core.config import settings
-from backend.app.data.scenarios import get_scenario
-from backend.app.services.tools.investigation_tools import (
-    INVESTIGATION_TOOL_FUNCTIONS,
-    get_failure_details,
-    get_recent_commits,
-    get_dependency_info,
-    get_workflow_definition,
-    inspect_commit,
+from backend.app.services.workspace.workspace_manager import workspace_manager
+from backend.app.services.tools.workspace_tools import (
+    WORKSPACE_TOOLS,
+    list_project_files,
+    search_code,
+    read_file,
+    inspect_dependencies,
+    discover_tests_and_commands,
+    run_tests,
+    edit_file,
+    write_file,
+    revert_file,
+    get_workspace_diff
 )
 from backend.app.schemas.investigation import (
     EvidenceModel,
@@ -31,10 +36,11 @@ logger = logging.getLogger("sentinelgraph.agent")
 
 class AgentOrchestrator:
     """
-    Manages the investigative agent lifecycle.
-    Orchestrates Gemini native function-calling with guardrails,
-    records event timelines, extracts structured evidence, and provides
-    a faithful deterministic fallback mode.
+    Autonomous software investigation and code repair agent.
+    Operates on real project source files within isolated workspaces using
+    native Gemini function-calling.
+    Enforces real test validation and safe workspace tool execution.
+    Does NOT use synthetic or deterministic fallback simulations.
     """
 
     def __init__(self):
@@ -46,66 +52,44 @@ class AgentOrchestrator:
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def run_investigation(
+    def run_project_investigation(
         self,
         investigation_id: str,
-        scenario_id: str,
-        force_deterministic: bool = False
+        project_id: str,
+        issue_description: Optional[str] = None
     ) -> Tuple[InvestigationReportModel, List[InvestigationEventModel]]:
-        scenario = get_scenario(scenario_id)
-        if not scenario:
-            raise ValueError(f"Scenario '{scenario_id}' not found.")
+        """
+        Main entry point for project investigation and repair.
+        Explicitly requires a valid Gemini API key.
+        """
+        project = workspace_manager.get_project(project_id)
+        if not project:
+            raise ValueError(f"Project '{project_id}' not found in workspace.")
 
-        # Determine whether to run Gemini Agent Mode or Deterministic Demo Mode
-        use_gemini = settings.has_gemini_key and not force_deterministic
-
-        events: List[InvestigationEventModel] = []
-        evidence_list: List[EvidenceModel] = []
-
-        if use_gemini:
-            try:
-                report, events, evidence_list = self._run_gemini_agent_loop(
-                    investigation_id=investigation_id,
-                    scenario_id=scenario_id,
-                    scenario=scenario
-                )
-                return report, events
-            except Exception as e:
-                logger.warning(
-                    f"Gemini agent failed or rate-limited: {e}. Falling back to DETERMINISTIC DEMO MODE."
-                )
-                events.append(
-                    InvestigationEventModel(
-                        event_id=f"evt-{len(events) + 1}",
-                        timestamp=self._now(),
-                        stage="Fallback Initialization",
-                        type="error",
-                        message=f"Gemini API request failed ({type(e).__name__}). Automatically engaged DETERMINISTIC DEMO MODE.",
-                        is_gemini_native=False
-                    )
-                )
-                # Seamlessly fall back to deterministic mode with explicit label
-                return self._run_deterministic_investigation(
-                    investigation_id=investigation_id,
-                    scenario_id=scenario_id,
-                    scenario=scenario,
-                    existing_events=events,
-                    fallback_reason=str(e)
-                )
-        else:
-            return self._run_deterministic_investigation(
-                investigation_id=investigation_id,
-                scenario_id=scenario_id,
-                scenario=scenario,
-                existing_events=[]
+        if not settings.has_gemini_key:
+            raise ValueError(
+                "Gemini API key is not configured. Please set GEMINI_API_KEY in backend/.env "
+                "to execute live AI project investigations. Automatic simulation fallback has been disabled."
             )
 
-    def _run_gemini_agent_loop(
+        try:
+            return self._run_gemini_project_loop(
+                investigation_id=investigation_id,
+                project_id=project_id,
+                project=project,
+                issue_description=issue_description
+            )
+        except Exception as e:
+            logger.error(f"Gemini live agent execution failed: {e}", exc_info=True)
+            raise RuntimeError(f"Live AI Agent investigation failed: {str(e)}")
+
+    def _run_gemini_project_loop(
         self,
         investigation_id: str,
-        scenario_id: str,
-        scenario: Dict[str, Any]
-    ) -> Tuple[InvestigationReportModel, List[InvestigationEventModel], List[EvidenceModel]]:
+        project_id: str,
+        project: Dict[str, Any],
+        issue_description: Optional[str] = None
+    ) -> Tuple[InvestigationReportModel, List[InvestigationEventModel]]:
         events: List[InvestigationEventModel] = []
         evidence_list: List[EvidenceModel] = []
 
@@ -115,7 +99,7 @@ class AgentOrchestrator:
                 timestamp=self._now(),
                 stage="Agent Initialization",
                 type="status",
-                message=f"Gemini Agent initialized with model '{self.model_name}'. Ready for dynamic tool selection.",
+                message=f"Gemini Agent initialized with model '{self.model_name}' for project '{project.get('name')}'.",
                 is_gemini_native=True
             )
         )
@@ -123,20 +107,32 @@ class AgentOrchestrator:
         client = genai.Client(api_key=self.api_key)
 
         tool_list = [
-            get_failure_details,
-            get_recent_commits,
-            get_dependency_info,
-            get_workflow_definition,
-            inspect_commit
+            list_project_files,
+            search_code,
+            read_file,
+            inspect_dependencies,
+            discover_tests_and_commands,
+            run_tests,
+            edit_file,
+            write_file,
+            revert_file,
+            get_workspace_diff
         ]
 
         system_instruction = (
-            "You are SentinelGraph, an expert agentic AI system for investigating cross-system workflow failures.\n"
-            "Your goal is to investigate why a workflow failed by autonomously selecting appropriate tools.\n"
-            "Always inspect failure details first, then check recent commits, workflow definition, dependencies, and commit diffs as needed.\n"
-            "Evaluate competing hypotheses. Base all conclusions strictly on returned evidence.\n"
-            "Do not fabricate root causes if the evidence is insufficient.\n"
-            f"The target scenario_id to investigate is: '{scenario_id}'."
+            "You are SentinelGraph, an expert autonomous AI software project investigation and repair agent.\n"
+            "You are operating on a real software project inside an isolated workspace.\n"
+            f"The target project_id is: '{project_id}'.\n\n"
+            "YOUR INVESTIGATION & REPAIR PROTOCOL:\n"
+            "1. First, discover existing tests using `discover_tests_and_commands` and run them with `run_tests`.\n"
+            "2. If tests fail, inspect the stack trace and failing assertion.\n"
+            "3. Read the failing test file and related source files with `read_file` to locate the defect.\n"
+            "4. Search the project codebase with `search_code` if needed to understand imports or schema contracts.\n"
+            "5. Apply a targeted fix using `edit_file` (or `write_file`) to resolve the root cause.\n"
+            "6. Immediately re-run `run_tests` to verify that all tests now pass!\n"
+            "7. Call `get_workspace_diff` to review your patch.\n"
+            "8. Formulate a final summary explaining what broke, why it broke, and how your fix resolved it.\n"
+            "Base all your reasoning on actual tool execution outputs."
         )
 
         chat = client.chats.create(
@@ -149,9 +145,9 @@ class AgentOrchestrator:
         )
 
         initial_prompt = (
-            f"An incident report has been triggered for scenario '{scenario_id}'. "
-            "Please begin the investigation. Assess what information is missing, select the necessary tools, "
-            "evaluate the returned evidence, and discover the probable root cause."
+            f"Please investigate project '{project.get('name')}' (project_id: '{project_id}').\n"
+            f"User Goal / Issue: {issue_description or 'Run tests, diagnose any failures or defects, apply a verified code fix, and confirm resolution.'}\n"
+            "Begin by discovering tests and running them to inspect the baseline status."
         )
 
         events.append(
@@ -160,7 +156,7 @@ class AgentOrchestrator:
                 timestamp=self._now(),
                 stage="Investigation Start",
                 type="status",
-                message="Submitted incident report to Gemini agent.",
+                message=f"Dispatched project '{project.get('name')}' to Gemini Agent.",
                 is_gemini_native=True
             )
         )
@@ -169,9 +165,11 @@ class AgentOrchestrator:
         iterations = 0
         total_tool_calls = 0
 
+        initial_test_failure = None
+
         while iterations < self.max_iterations and total_tool_calls < self.max_tool_calls:
             iterations += 1
-            function_calls = response.function_calls
+            function_calls = getattr(response, "function_calls", None)
 
             if not function_calls:
                 events.append(
@@ -180,7 +178,7 @@ class AgentOrchestrator:
                         timestamp=self._now(),
                         stage="Synthesis",
                         type="conclusion",
-                        message="Gemini completed investigation without requiring further tool executions.",
+                        message="Gemini completed investigation and repair actions.",
                         is_gemini_native=True
                     )
                 )
@@ -192,21 +190,8 @@ class AgentOrchestrator:
                 tool_name = call.name
                 tool_args = dict(call.args) if call.args else {}
 
-                # Guarantee scenario_id is supplied
-                if "scenario_id" not in tool_args:
-                    tool_args["scenario_id"] = scenario_id
-
-                # Normalize argument aliases
-                if tool_name == "inspect_commit" and "commit_id" not in tool_args:
-                    for alias in ("commit_hash", "commit", "sha", "hash"):
-                        if alias in tool_args:
-                            tool_args["commit_id"] = tool_args[alias]
-                            break
-                elif tool_name == "get_recent_commits" and "limit" not in tool_args:
-                    for alias in ("count", "n", "max_commits", "max_results"):
-                        if alias in tool_args:
-                            tool_args["limit"] = tool_args[alias]
-                            break
+                # Guarantee project_id is passed
+                tool_args["project_id"] = project_id
 
                 events.append(
                     InvestigationEventModel(
@@ -221,26 +206,30 @@ class AgentOrchestrator:
                     )
                 )
 
-                if tool_name in INVESTIGATION_TOOL_FUNCTIONS:
-                    tool_func = INVESTIGATION_TOOL_FUNCTIONS[tool_name]
+                if tool_name in WORKSPACE_TOOLS:
+                    tool_func = WORKSPACE_TOOLS[tool_name]
                     try:
                         result = tool_func(**tool_args)
                     except Exception as ex:
                         result = {"status": "error", "error": f"Tool execution failed: {str(ex)}"}
                 else:
-                    result = {"status": "error", "error": f"Unknown tool: '{tool_name}'"}
+                    result = {"status": "error", "error": f"Unknown workspace tool: '{tool_name}'"}
+
+                # Capture initial test failure for report summary
+                if tool_name == "run_tests" and not result.get("passed", True) and not initial_test_failure:
+                    initial_test_failure = result
 
                 # Extract verifiable evidence from tool result
-                new_evidence = self._extract_evidence_from_result(tool_name, tool_args, result)
+                new_evidence = self._extract_workspace_evidence(tool_name, tool_args, result)
                 evidence_list.extend(new_evidence)
 
                 events.append(
                     InvestigationEventModel(
                         event_id=f"evt-{len(events) + 1}",
                         timestamp=self._now(),
-                        stage="Observation & Evidence Collection",
+                        stage="Observation & Action",
                         type="tool_result",
-                        message=f"Received result from {tool_name} ({len(new_evidence)} evidence item(s) captured)",
+                        message=f"Executed {tool_name}: {result.get('message') or result.get('status')}",
                         tool_name=tool_name,
                         tool_result=result,
                         is_gemini_native=True
@@ -257,161 +246,25 @@ class AgentOrchestrator:
             # Return tool execution outputs back to Gemini
             response = chat.send_message(tool_responses)
 
-        # Capture Gemini natural language reasoning if produced
+        # Final verification: execute real tests in the workspace to evaluate final state
+        final_test_run = run_tests(project_id=project_id)
+        diff_info = get_workspace_diff(project_id=project_id)
         gemini_reasoning = getattr(response, "text", None) if response else None
 
-        # Build structured report strictly grounded in collected evidence
-        report = self._construct_structured_report(
+        report = self._construct_project_report(
             investigation_id=investigation_id,
-            scenario_id=scenario_id,
-            scenario=scenario,
-            mode="AI AGENT MODE",
+            project_id=project_id,
+            project=project,
+            initial_test_failure=initial_test_failure,
+            final_test_run=final_test_run,
+            diff_info=diff_info,
             evidence_list=evidence_list,
             gemini_reasoning=gemini_reasoning
         )
 
-        return report, events, evidence_list
-
-    def _run_deterministic_investigation(
-        self,
-        investigation_id: str,
-        scenario_id: str,
-        scenario: Dict[str, Any],
-        existing_events: Optional[List[InvestigationEventModel]] = None,
-        fallback_reason: Optional[str] = None
-    ) -> Tuple[InvestigationReportModel, List[InvestigationEventModel]]:
-        events = existing_events if existing_events is not None else []
-        evidence_list: List[EvidenceModel] = []
-
-        events.append(
-            InvestigationEventModel(
-                event_id=f"evt-{len(events) + 1}",
-                timestamp=self._now(),
-                stage="Investigation Start",
-                type="status",
-                message=f"Started controlled deterministic investigation trace for scenario '{scenario.get('name')}'.",
-                is_gemini_native=False
-            )
-        )
-
-        # Step 1: Failure Details
-        tool_args_1 = {"scenario_id": scenario_id}
-        res_1 = get_failure_details(**tool_args_1)
-        ev_1 = self._extract_evidence_from_result("get_failure_details", tool_args_1, res_1)
-        evidence_list.extend(ev_1)
-        events.append(
-            InvestigationEventModel(
-                event_id=f"evt-{len(events) + 1}",
-                timestamp=self._now(),
-                stage="Failure Inspection",
-                type="tool_call",
-                message="Retrieved failure details and exception trace.",
-                tool_name="get_failure_details",
-                tool_args=tool_args_1,
-                tool_result=res_1,
-                is_gemini_native=False
-            )
-        )
-
-        # Step 2: Recent Commits
-        tool_args_2 = {"scenario_id": scenario_id, "limit": 5}
-        res_2 = get_recent_commits(**tool_args_2)
-        ev_2 = self._extract_evidence_from_result("get_recent_commits", tool_args_2, res_2)
-        evidence_list.extend(ev_2)
-        events.append(
-            InvestigationEventModel(
-                event_id=f"evt-{len(events) + 1}",
-                timestamp=self._now(),
-                stage="Commit History Analysis",
-                type="tool_call",
-                message=f"Retrieved {len(res_2.get('commits', []))} recent repository commits.",
-                tool_name="get_recent_commits",
-                tool_args=tool_args_2,
-                tool_result=res_2,
-                is_gemini_native=False
-            )
-        )
-
-        # Step 3: Workflow Definition
-        tool_args_3 = {"scenario_id": scenario_id}
-        res_3 = get_workflow_definition(**tool_args_3)
-        ev_3 = self._extract_evidence_from_result("get_workflow_definition", tool_args_3, res_3)
-        evidence_list.extend(ev_3)
-        events.append(
-            InvestigationEventModel(
-                event_id=f"evt-{len(events) + 1}",
-                timestamp=self._now(),
-                stage="Workflow Contract Inspection",
-                type="tool_call",
-                message="Retrieved workflow step sequence and field requirements.",
-                tool_name="get_workflow_definition",
-                tool_args=tool_args_3,
-                tool_result=res_3,
-                is_gemini_native=False
-            )
-        )
-
-        # Step 4: Dependencies
-        tool_args_4 = {"scenario_id": scenario_id}
-        res_4 = get_dependency_info(**tool_args_4)
-        ev_4 = self._extract_evidence_from_result("get_dependency_info", tool_args_4, res_4)
-        evidence_list.extend(ev_4)
-        events.append(
-            InvestigationEventModel(
-                event_id=f"evt-{len(events) + 1}",
-                timestamp=self._now(),
-                stage="Dependency Graph Discovery",
-                type="tool_call",
-                message="Analyzed cross-service upstream and downstream dependency contracts.",
-                tool_name="get_dependency_info",
-                tool_args=tool_args_4,
-                tool_result=res_4,
-                is_gemini_native=False
-            )
-        )
-
-        # Step 5: Diff Inspection (if applicable)
-        if scenario_id == "scenario-invoice-field-rename":
-            tool_args_5 = {"scenario_id": scenario_id, "commit_id": "4f8a12d"}
-            res_5 = inspect_commit(**tool_args_5)
-            ev_5 = self._extract_evidence_from_result("inspect_commit", tool_args_5, res_5)
-            evidence_list.extend(ev_5)
-            events.append(
-                InvestigationEventModel(
-                    event_id=f"evt-{len(events) + 1}",
-                    timestamp=self._now(),
-                    stage="Commit Diff Analysis",
-                    type="tool_call",
-                    message="Inspected commit 4f8a12d: confirmed 'customer_email' was renamed to 'email'.",
-                    tool_name="inspect_commit",
-                    tool_args=tool_args_5,
-                    tool_result=res_5,
-                    is_gemini_native=False
-                )
-            )
-
-        events.append(
-            InvestigationEventModel(
-                event_id=f"evt-{len(events) + 1}",
-                timestamp=self._now(),
-                stage="Causal Chain Synthesis",
-                type="conclusion",
-                message="Completed investigation synthesis and generated evidence-backed causal report.",
-                is_gemini_native=False
-            )
-        )
-
-        report = self._construct_structured_report(
-            investigation_id=investigation_id,
-            scenario_id=scenario_id,
-            scenario=scenario,
-            mode="DETERMINISTIC DEMO MODE",
-            evidence_list=evidence_list
-        )
-
         return report, events
 
-    def _extract_evidence_from_result(
+    def _extract_workspace_evidence(
         self,
         tool_name: str,
         tool_args: Dict[str, Any],
@@ -420,296 +273,205 @@ class AgentOrchestrator:
         evidence = []
         now = self._now()
 
-        if tool_name == "get_failure_details" and result.get("status") == "success":
+        if tool_name == "run_tests":
+            status_str = "PASSED" if result.get("passed") else "FAILED"
             evidence.append(
                 EvidenceModel(
-                    id=f"EVID-{result.get('failure_id', 'FAIL')}",
-                    type="error_log",
-                    title=f"Workflow Execution Failure: {result.get('error_type')}",
-                    description=f"{result.get('error_message')} at execution {result.get('execution_id')}",
-                    source="workflow_engine",
-                    timestamp=result.get("timestamp", now),
-                    relevance="high",
-                    observed=True,
-                    metadata={
-                        "workflow_id": result.get("workflow_id"),
-                        "component": result.get("affected_component")
-                    }
-                )
-            )
-
-        elif tool_name == "get_recent_commits" and result.get("status") == "success":
-            for commit in result.get("commits", []):
-                evidence.append(
-                    EvidenceModel(
-                        id=f"EVID-COMMIT-{commit.get('commit_id')}",
-                        type="commit_metadata",
-                        title=f"Commit {commit.get('commit_id')}: {commit.get('message')}",
-                        description=f"Authored by {commit.get('author')}, modifying {len(commit.get('files_changed', []))} file(s).",
-                        source="mock_repository",
-                        timestamp=commit.get("timestamp", now),
-                        relevance="high" if "api.py" in str(commit.get("files_changed")) else "medium",
-                        observed=True,
-                        metadata=commit
-                    )
-                )
-
-        elif tool_name == "get_workflow_definition" and result.get("status") == "success":
-            evidence.append(
-                EvidenceModel(
-                    id=f"EVID-WF-{result.get('workflow_id', 'DEF')}",
-                    type="workflow_definition",
-                    title=f"Workflow Definition: {result.get('name')}",
-                    description=f"Consists of {len(result.get('steps', []))} steps. Requires fields defined in schema contract.",
-                    source="orchestration_runtime",
-                    timestamp=now,
-                    relevance="high",
-                    observed=True,
-                    metadata={"steps": result.get("steps")}
-                )
-            )
-
-        elif tool_name == "get_dependency_info" and result.get("status") == "success":
-            for contract in result.get("field_contracts", []):
-                evidence.append(
-                    EvidenceModel(
-                        id=f"EVID-CONTRACT-{contract.get('field_name')}",
-                        type="dependency_contract",
-                        title=f"Field Contract: {contract.get('field_name')}",
-                        description=f"Produced by {contract.get('producer')} and consumed by {contract.get('consumer')}.",
-                        source="api_catalog",
-                        timestamp=now,
-                        relevance="high",
-                        observed=True,
-                        metadata=contract
-                    )
-                )
-
-        elif tool_name == "inspect_commit" and result.get("status") == "success":
-            evidence.append(
-                EvidenceModel(
-                    id=f"EVID-DIFF-{result.get('commit_id')}",
-                    type="commit_diff",
-                    title=f"Commit Diff {result.get('commit_id')}: {result.get('file')}",
-                    description=result.get("description", "Code diff inspected in repository history."),
-                    source="git_diff_engine",
+                    id=f"EVID-TEST-{len(evidence) + 1}-{int(datetime.now().timestamp())}",
+                    type="test_execution",
+                    title=f"Test Suite Execution: {status_str} (Exit Code {result.get('exit_code')})",
+                    description=result.get("output", "")[:400],
+                    source="pytest_subprocess",
                     timestamp=now,
                     relevance="high",
                     observed=True,
                     metadata={
-                        "file": result.get("file"),
-                        "diff": result.get("diff")
+                        "command": result.get("command"),
+                        "exit_code": result.get("exit_code"),
+                        "passed": result.get("passed"),
+                        "duration": result.get("duration_seconds")
                     }
+                )
+            )
+
+        elif tool_name == "read_file" and result.get("status") == "success":
+            evidence.append(
+                EvidenceModel(
+                    id=f"EVID-FILE-{tool_args.get('file_path')}",
+                    type="code_inspection",
+                    title=f"Source Code Inspection: {tool_args.get('file_path')}",
+                    description=f"Read {result.get('total_lines')} lines from {tool_args.get('file_path')}.",
+                    source="workspace_filesystem",
+                    timestamp=now,
+                    relevance="high",
+                    observed=True,
+                    metadata={"file": tool_args.get("file_path"), "lines": result.get("total_lines")}
+                )
+            )
+
+        elif tool_name == "edit_file" and result.get("status") == "success":
+            evidence.append(
+                EvidenceModel(
+                    id=f"EVID-PATCH-{tool_args.get('file_path')}",
+                    type="code_patch",
+                    title=f"Code Patch Applied: {tool_args.get('file_path')}",
+                    description=result.get("message", "Target snippet replaced in source file."),
+                    source="patch_engine",
+                    timestamp=now,
+                    relevance="high",
+                    observed=True,
+                    metadata={"file": tool_args.get("file_path")}
+                )
+            )
+
+        elif tool_name == "search_code" and result.get("status") == "success":
+            matches = result.get("matches", [])
+            evidence.append(
+                EvidenceModel(
+                    id=f"EVID-SEARCH-{abs(hash(tool_args.get('query', '')))}",
+                    type="code_search",
+                    title=f"Search Code: '{tool_args.get('query')}' ({len(matches)} matches)",
+                    description=f"Found {len(matches)} reference(s) across project codebase.",
+                    source="code_indexer",
+                    timestamp=now,
+                    relevance="medium",
+                    observed=True,
+                    metadata={"query": tool_args.get("query"), "count": len(matches)}
                 )
             )
 
         return evidence
 
-    def _construct_structured_report(
+    def _construct_project_report(
         self,
         investigation_id: str,
-        scenario_id: str,
-        scenario: Dict[str, Any],
-        mode: str,
+        project_id: str,
+        project: Dict[str, Any],
+        initial_test_failure: Optional[Dict[str, Any]],
+        final_test_run: Dict[str, Any],
+        diff_info: Dict[str, Any],
         evidence_list: List[EvidenceModel],
         gemini_reasoning: Optional[str] = None
     ) -> InvestigationReportModel:
-        failure_data = scenario.get("failure", {})
-        remediation_raw = scenario.get("remediation_options", [])
-        recs = [RemediationOptionModel(**r) for r in remediation_raw]
-        observed_ids = {e.id for e in evidence_list}
+        now = self._now()
+        is_verified = final_test_run.get("passed", False)
+        changed_files = diff_info.get("changed_files", [])
+        patch_diff = diff_info.get("diff", "")
 
-        if scenario_id == "scenario-invoice-field-rename":
-            has_diff = any("DIFF" in eid for eid in observed_ids)
-            has_contract = any("CONTRACT" in eid for eid in observed_ids)
-            has_fail = any("FAIL" in eid for eid in observed_ids)
-            has_commit = any("COMMIT" in eid for eid in observed_ids)
+        observed_ids = [e.id for e in evidence_list]
 
-            if has_diff:
-                confidence = 0.96
-                confidence_label = "High Confidence"
-                rc_status = "probable"
-                supported_ev_ids = [eid for eid in observed_ids if "DIFF-4f8a12d" in eid or "CONTRACT" in eid or "FAIL" in eid or "COMMIT-4f8a12d" in eid]
-                explanation = (
-                    "Commit 4f8a12d ('standardize response fields') in services/customer/api.py changed "
-                    "the JSON response key from 'customer_email' to 'email'. The change was deployed "
-                    "without updating dependent workflows, causing wf-invoice-gen-v2 step 3 to fail."
-                )
-                hyp1_status = "supported"
-                hyp2_status = "refuted"
-                investigation_status = "completed"
-            elif has_commit or has_contract or has_fail:
-                confidence = 0.65
-                confidence_label = "Moderate Assessment"
-                rc_status = "unconfirmed"
-                supported_ev_ids = [eid for eid in observed_ids if "CONTRACT" in eid or "FAIL" in eid or "COMMIT" in eid]
-                explanation = (
-                    "Workflow failure indicates a missing 'customer_email' field, and recent commit history "
-                    "shows modifications to services/customer/api.py. However, the exact code diff was not inspected "
-                    "during this investigation, so the root cause remains an unconfirmed suspicion."
-                )
-                hyp1_status = "inconclusive"
-                hyp2_status = "inconclusive"
-                investigation_status = "completed"
-            else:
-                confidence = 0.20
-                confidence_label = "Unconfirmed / Insufficient Evidence"
-                rc_status = "unconfirmed"
-                supported_ev_ids = []
-                explanation = "No evidence was collected during the investigation. Root cause cannot be confirmed."
-                hyp1_status = "inconclusive"
-                hyp2_status = "inconclusive"
-                investigation_status = "unresolved"
-
-            summary_text = (
-                gemini_reasoning.strip() if gemini_reasoning and len(gemini_reasoning.strip()) > 30
-                else (
-                    "Investigation confirmed a cross-system breaking contract change. "
-                    "Commit 4f8a12d renamed the customer API response key 'customer_email' to 'email'. "
-                    "The invoice automation workflow depends on 'customer_email' to extract the recipient, "
-                    "causing a KeyError at step 3."
-                )
+        if is_verified:
+            status = "completed"
+            conf = 0.98
+            conf_label = "High Confidence"
+            rc_status = "probable"
+            rc_title = "Defect Discovered and Automatically Remediated"
+            rc_explanation = (
+                f"Agent discovered a defect affecting project '{project.get('name')}'. "
+                f"A targeted patch was applied to {', '.join(changed_files) if changed_files else 'source files'}. "
+                f"Re-running tests confirmed full resolution with all tests passing (exit code 0)."
             )
-
-            return InvestigationReportModel(
-                investigation_id=investigation_id,
-                scenario_id=scenario_id,
-                mode=mode,
-                status=investigation_status,
-                summary=summary_text,
-                failure=FailureSummaryModel(
-                    failure_id=failure_data.get("failure_id", "FAIL-9021"),
-                    title="Invoice Customer Dispatcher Failure",
-                    description=failure_data.get("error_message", "Field missing error"),
-                    workflow_id=failure_data.get("workflow_id", "wf-invoice-gen-v2"),
-                    affected_component=failure_data.get("affected_component", "invoice-generator"),
-                    timestamp=failure_data.get("timestamp", self._now()),
-                    error_message=failure_data.get("error_message", "")
-                ),
-                root_cause=RootCauseModel(
-                    title="Backend API Field Rename Contract Break",
-                    explanation=explanation,
-                    confidence=confidence,
-                    confidence_label=confidence_label,
-                    status=rc_status,
-                    evidence_ids=supported_ev_ids
-                ),
-                hypotheses=[
-                    HypothesisModel(
-                        id="HYP-1",
-                        title="Backend API Field Renamed to 'email'",
-                        description="Commit 4f8a12d renamed customer_email to email, breaking step 3 contract.",
-                        status=hyp1_status,
-                        supporting_evidence_ids=supported_ev_ids
-                    ),
-                    HypothesisModel(
-                        id="HYP-2",
-                        title="Redis Client Upgrade Incompatibility",
-                        description="Commit 9c12b7e bumped Redis client version, potentially failing cache retrieval.",
-                        status=hyp2_status,
-                        supporting_evidence_ids=[]
-                    )
-                ],
-                evidence=evidence_list,
-                causal_chain=[
-                    "Commit 4f8a12d refactored customer API",
-                    "Customer API response key renamed: customer_email -> email",
-                    "Invoice workflow step 3 expected customer_email",
-                    "KeyError raised during invoice generation"
-                ],
-                affected_components=[
-                    "services/customer/api.py",
-                    "wf-invoice-gen-v2 (Invoice Customer Dispatcher)",
-                    "billing-notification-worker"
-                ],
-                recommendations=recs,
-                remaining_unknowns=[] if has_diff else ["Exact commit diff unobserved in investigation trace"],
-                verification=VerificationResultModel(
-                    status="not_run",
-                    simulated=True,
-                    message="Remediation not yet applied. Choose an option to simulate verification."
-                )
+            ver_status = "passed"
+            ver_msg = (
+                f"Real verification PASSED via test execution. "
+                f"Exit Code: {final_test_run.get('exit_code')}, Duration: {final_test_run.get('duration_seconds')}s. "
+                f"Tests passed: {final_test_run.get('tests_passed', 'All')}."
             )
-
         else:
-            # Ambiguous / insufficient evidence case
-            supporting_ev_ids = [eid for eid in observed_ids if "FAIL" in eid]
-            if not supporting_ev_ids and observed_ids:
-                supporting_ev_ids = list(observed_ids)[:2]
-
-            summary_text = (
-                gemini_reasoning.strip() if gemini_reasoning and len(gemini_reasoning.strip()) > 30
-                else (
-                    "Investigation conducted across recent commits, repository diffs, and workflow definitions. "
-                    "The upstream payment settlement gateway timed out after 30000ms. "
-                    "None of the recent repository commits touched the payment gateway or timeout settings. "
-                    "Available evidence is insufficient to confirm an internal root cause."
-                )
+            status = "unresolved"
+            conf = 0.45
+            conf_label = "Moderate Assessment"
+            rc_status = "unconfirmed"
+            rc_title = "Defect Investigation Inconclusive or Unresolved"
+            rc_explanation = (
+                "Tests continue to fail or defect could not be definitively resolved with the current patch."
+            )
+            ver_status = "failed"
+            ver_msg = (
+                f"Real verification FAILED. Test command exited with code {final_test_run.get('exit_code')}."
             )
 
-            return InvestigationReportModel(
-                investigation_id=investigation_id,
-                scenario_id=scenario_id,
-                mode=mode,
-                status="unresolved",
-                summary=summary_text,
-                failure=FailureSummaryModel(
-                    failure_id=failure_data.get("failure_id", "FAIL-8842"),
-                    title="Payment Reconciliation Timeout",
-                    description=failure_data.get("error_message", "GatewayTimeoutError"),
-                    workflow_id=failure_data.get("workflow_id", "wf-payment-reconcile"),
-                    affected_component=failure_data.get("affected_component", "reconciliation-worker"),
-                    timestamp=failure_data.get("timestamp", self._now()),
-                    error_message=failure_data.get("error_message", "")
-                ),
-                root_cause=RootCauseModel(
-                    title="Unconfirmed External Gateway Latency / Provider Downtime",
-                    explanation=(
-                        "Evidence shows an upstream gateway timeout (30s) occurred. "
-                        "Recent repository commits (README updates, CSS styling) are unrelated. "
-                        "Without external provider telemetry or network logs, root cause remains unconfirmed."
-                    ),
-                    confidence=0.35,
-                    confidence_label="Unconfirmed / Insufficient Evidence",
-                    status="unconfirmed",
-                    evidence_ids=supporting_ev_ids
-                ),
-                hypotheses=[
-                    HypothesisModel(
-                        id="HYP-1",
-                        title="Recent Repository Commits Introduced Regression",
-                        description="Recent code changes in repo caused the timeout.",
-                        status="refuted",
-                        supporting_evidence_ids=[]
-                    ),
-                    HypothesisModel(
-                        id="HYP-2",
-                        title="Transient Upstream Provider Degradation",
-                        description="External settlement partner experienced latency or transient downtime.",
-                        status="inconclusive",
-                        supporting_evidence_ids=supporting_ev_ids
-                    )
-                ],
-                evidence=evidence_list,
-                causal_chain=[
-                    "Reconciliation worker initiated batch sync to partner gateway",
-                    "HTTP timeout expired at 30000ms without response",
-                    "GatewayTimeoutError raised",
-                    "Recent commits checked and confirmed unrelated"
-                ],
-                affected_components=[
-                    "wf-payment-reconcile",
-                    "reconciliation-worker",
-                    "https://settlement.partner.example.test"
-                ],
-                recommendations=recs,
-                remaining_unknowns=[
-                    "External settlement partner status & incident dashboard",
-                    "Network egress packet drop rates between VPC and partner host"
-                ],
-                verification=VerificationResultModel(
-                    status="not_run",
-                    simulated=True,
-                    message="Remediation not yet applied. Choose an option to simulate verification."
-                )
+        summary_text = (
+            gemini_reasoning.strip() if gemini_reasoning and len(gemini_reasoning.strip()) > 30
+            else (
+                f"Autonomous investigation for project '{project.get('name')}'. "
+                f"{'Defect successfully fixed and verified against real tests.' if is_verified else 'Test suite execution encountered failures.'}"
             )
+        )
+
+        failure_err = "Test failures detected"
+        if initial_test_failure:
+            failure_err = initial_test_failure.get("output", "")[:250]
+        elif not is_verified:
+            failure_err = final_test_run.get("output", "")[:250]
+
+        return InvestigationReportModel(
+            investigation_id=investigation_id,
+            project_id=project_id,
+            mode="AI AGENT MODE",
+            status=status,
+            summary=summary_text,
+            failure=FailureSummaryModel(
+                failure_id=f"FAIL-{project_id[:8].upper()}",
+                title=f"Project Test Suite Failure ({project.get('name')})",
+                description=failure_err,
+                affected_component=changed_files[0] if changed_files else "project_source",
+                timestamp=now,
+                error_message=failure_err
+            ),
+            root_cause=RootCauseModel(
+                title=rc_title,
+                explanation=rc_explanation,
+                confidence=conf,
+                confidence_label=conf_label,
+                status=rc_status,
+                evidence_ids=observed_ids[:5]
+            ),
+            hypotheses=[
+                HypothesisModel(
+                    id="HYP-1",
+                    title="Code Defect or Schema Incompatibility",
+                    description="Source code mismatch or bug causing test failures.",
+                    status="supported" if is_verified else "inconclusive",
+                    supporting_evidence_ids=observed_ids[:3]
+                )
+            ],
+            evidence=evidence_list,
+            causal_chain=[
+                "Discovered project test suite and entry points",
+                "Executed baseline tests and captured error trace",
+                "Inspected source files and identified root cause defect",
+                f"Applied patch to {', '.join(changed_files) if changed_files else 'source code'}",
+                f"Executed verification tests: {'PASS' if is_verified else 'FAIL'}"
+            ],
+            affected_components=changed_files if changed_files else ["src/"],
+            recommendations=[
+                RemediationOptionModel(
+                    option_id="opt-apply-patch",
+                    title="Apply Verified Code Patch",
+                    target=", ".join(changed_files) if changed_files else "Source Code",
+                    description="Apply the targeted code patch discovered and verified by SentinelGraph.",
+                    trade_offs="Resolves failing tests directly in source code.",
+                    resolves_failure=is_verified
+                )
+            ],
+            remaining_unknowns=[] if is_verified else ["Unresolved test assertion errors in test suite"],
+            verification=VerificationResultModel(
+                status=ver_status,
+                simulated=False,
+                notice="REAL VERIFICATION VIA TEST EXECUTION",
+                timestamp=now,
+                applied_option_id="opt-apply-patch",
+                applied_option_title="Apply Verified Code Patch",
+                message=ver_msg,
+                command=final_test_run.get("command"),
+                exit_code=final_test_run.get("exit_code"),
+                duration_seconds=final_test_run.get("duration_seconds"),
+                tests_passed=final_test_run.get("tests_passed"),
+                tests_failed=final_test_run.get("tests_failed"),
+                output=final_test_run.get("output"),
+                patch_diff=patch_diff
+            ),
+            diff=patch_diff,
+            changed_files=changed_files
+        )

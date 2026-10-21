@@ -1,6 +1,6 @@
 export type InvestigationStatus = "queued" | "investigating" | "completed" | "unresolved" | "failed";
 
-export type ComponentType = "commit" | "api_schema" | "workflow_step" | "failure" | "external_service";
+export type ComponentType = "commit" | "api_schema" | "workflow_step" | "failure" | "external_service" | "source_file" | "test_file";
 
 export type NodeStatus = "confirmed" | "probable_cause" | "affected_component" | "unverified_hypothesis";
 
@@ -10,7 +10,10 @@ export type EdgeRelationship =
   | "consumes"
   | "incompatible_with"
   | "contributed_to"
-  | "observed_before";
+  | "observed_before"
+  | "tests"
+  | "imports"
+  | "repaired_by";
 
 export interface Evidence {
   id: string;
@@ -72,7 +75,7 @@ export interface FailureSummary {
   failure_id: string;
   title: string;
   description: string;
-  workflow_id: string;
+  workflow_id?: string | null;
   affected_component: string;
   timestamp: string;
   error_message: string;
@@ -113,12 +116,20 @@ export interface VerificationResult {
   applied_option_title?: string | null;
   message: string;
   details?: Record<string, any> | null;
+  command?: string | null;
+  exit_code?: number | null;
+  duration_seconds?: number | null;
+  tests_passed?: number | null;
+  tests_failed?: number | null;
+  output?: string | null;
+  patch_diff?: string | null;
 }
 
 export interface InvestigationReport {
   investigation_id: string;
-  scenario_id: string;
-  mode: "AI AGENT MODE" | "DETERMINISTIC DEMO MODE";
+  scenario_id?: string | null;
+  project_id?: string | null;
+  mode: string;
   status: InvestigationStatus;
   summary: string;
   failure: FailureSummary;
@@ -130,6 +141,39 @@ export interface InvestigationReport {
   recommendations: RemediationOption[];
   remaining_unknowns: string[];
   verification: VerificationResult;
+  diff?: string | null;
+  changed_files?: string[];
+}
+
+export interface ProjectOverview {
+  project_id: string;
+  name: string;
+  filename: string;
+  file_count: number;
+  total_size_bytes: number;
+  created_at: string;
+  files: string[];
+  is_sample?: boolean;
+}
+
+export interface WorkspaceDiff {
+  project_id: string;
+  changed_files: string[];
+  total_changed_files: number;
+  diff: string;
+}
+
+export interface TestRunResult {
+  status: string;
+  project_id: string;
+  command?: string | null;
+  exit_code?: number | null;
+  passed: boolean;
+  duration_seconds?: number | null;
+  tests_passed?: number | null;
+  tests_failed?: number | null;
+  output?: string | null;
+  message: string;
 }
 
 export interface ScenarioOverview {
@@ -148,11 +192,13 @@ export interface DashboardStats {
   resolved_investigations: number;
   unresolved_investigations: number;
   active_connections: number;
-  mode_available: "AI AGENT MODE" | "DETERMINISTIC DEMO MODE";
+  uploaded_projects?: number;
+  mode_available: string;
   gemini_model_configured: string;
   recent_investigations: Array<{
     investigation_id: string;
-    scenario_id: string;
+    project_id?: string;
+    scenario_id?: string;
     mode: string;
     status: string;
     workflow: string;

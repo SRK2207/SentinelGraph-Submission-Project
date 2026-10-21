@@ -11,29 +11,28 @@ from backend.app.schemas.investigation import (
     ApplyRemediationRequest,
     DashboardStatsModel,
     ConnectionStatusModel,
-    ScenarioOverviewModel
+    ScenarioOverviewModel,
+    ProjectOverviewModel
 )
 from backend.app.core.config import settings
-from backend.app.data.scenarios import (
-    get_all_scenarios,
-    get_scenario,
-    reset_all_scenarios
-)
+from backend.app.services.workspace.workspace_manager import workspace_manager
+from backend.app.services.tools.workspace_tools import run_tests, get_workspace_diff
 from backend.app.services.agent.agent_service import AgentOrchestrator
 from backend.app.services.graph.graph_engine import CausalGraphEngine
-from backend.app.services.verification.verifier import VerificationEngine
 
 
 class InvestigationRecord:
     def __init__(
         self,
         investigation_id: str,
-        scenario_id: str,
+        project_id: Optional[str],
+        scenario_id: Optional[str],
         report: InvestigationReportModel,
         events: List[InvestigationEventModel],
         graph: GraphDataModel
     ):
         self.investigation_id = investigation_id
+        self.project_id = project_id
         self.scenario_id = scenario_id
         self.report = report
         self.events = events
@@ -43,8 +42,8 @@ class InvestigationRecord:
 
 class InvestigationManager:
     """
-    Central manager for investigations, event histories, and graph models.
-    Stores records in-memory for the local MVP.
+    Central manager for investigations, event histories, and real workspace states.
+    Dispatches investigations to the live AI agent and verifies real test outcomes.
     """
 
     def __init__(self):
@@ -55,15 +54,17 @@ class InvestigationManager:
         total = len(self._investigations)
         resolved = sum(1 for inv in self._investigations.values() if inv.report.status == "completed")
         unresolved = sum(1 for inv in self._investigations.values() if inv.report.status == "unresolved")
+        projects = workspace_manager.list_projects()
 
         recent = []
         for inv in reversed(list(self._investigations.values())):
             recent.append({
                 "investigation_id": inv.investigation_id,
+                "project_id": inv.project_id,
                 "scenario_id": inv.scenario_id,
                 "mode": inv.report.mode,
                 "status": inv.report.status,
-                "workflow": inv.report.failure.workflow_id,
+                "workflow": inv.report.failure.workflow_id or inv.project_id or "Test Suite",
                 "timestamp": inv.created_at,
                 "root_cause": inv.report.root_cause.title,
                 "confidence_label": inv.report.root_cause.confidence_label
@@ -75,102 +76,98 @@ class InvestigationManager:
             total_investigations=total,
             resolved_investigations=resolved,
             unresolved_investigations=unresolved,
-            active_connections=4,
-            mode_available="AI AGENT MODE" if settings.has_gemini_key else "DETERMINISTIC DEMO MODE",
+            active_connections=len(projects),
+            uploaded_projects=len(projects),
+            mode_available="AI AGENT MODE" if settings.has_gemini_key else "API KEY REQUIRED",
             gemini_model_configured=settings.gemini_model,
             recent_investigations=recent
         )
 
     def get_connections(self) -> List[ConnectionStatusModel]:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        return [
+        projects = workspace_manager.list_projects()
+        connections = [
             ConnectionStatusModel(
-                id="conn-git-repo",
-                name="Source Repository (Git)",
-                type="Version Control System",
-                status="MOCK DATA",
-                description="Simulated Git repository index containing recent commits, authors, and schema diffs.",
+                id="conn-gemini-ai",
+                name="Google Gemini AI Engine",
+                type="Agentic LLM Runtime",
+                status="MOCK DATA" if not settings.has_gemini_key else "SIMULATED",
+                description=f"Model: {settings.gemini_model}. {'Configured and ready.' if settings.has_gemini_key else 'API key not configured.'}",
                 last_sync=now,
-                records_available=3
+                records_available=1 if settings.has_gemini_key else 0
             ),
             ConnectionStatusModel(
-                id="conn-backend-api",
-                name="Customer Profile API",
-                type="Microservice / REST",
-                status="SIMULATED",
-                description="Simulated customer profile backend service providing user entities and contracts.",
+                id="conn-workspace-fs",
+                name="Isolated Project Workspaces",
+                type="Filesystem Sandbox",
+                status="MOCK DATA",
+                description="Secure isolated filesystem sandboxes for uploaded project exploration and patching.",
+                last_sync=now,
+                records_available=len(projects)
+            ),
+            ConnectionStatusModel(
+                id="conn-subprocess-runner",
+                name="Subprocess Test Execution Runtime",
+                type="Execution Sandbox",
+                status="MOCK DATA",
+                description="Sandboxed subprocess executor running pytest and test runners with strict timeouts.",
                 last_sync=now,
                 records_available=1
-            ),
-            ConnectionStatusModel(
-                id="conn-schema-catalog",
-                name="Data Contract & Schema Catalog",
-                type="Contract Registry",
-                status="MOCK DATA",
-                description="Simulated schema registry tracking field types, deprecations, and consumers.",
-                last_sync=now,
-                records_available=2
-            ),
-            ConnectionStatusModel(
-                id="conn-workflow-engine",
-                name="Invoice Dispatch Orchestrator",
-                type="Workflow Automation",
-                status="SIMULATED",
-                description="Simulated automation engine executing multi-step business delivery workflows.",
-                last_sync=now,
-                records_available=2
             )
         ]
-
-    def get_scenarios(self) -> List[ScenarioOverviewModel]:
-        scenarios = get_all_scenarios()
-        overview_list = []
-        for s_id, s in scenarios.items():
-            failure = s.get("failure", {})
-            overview_list.append(
-                ScenarioOverviewModel(
-                    id=s_id,
-                    name=s.get("name", s_id),
-                    category=s.get("category", "General"),
-                    description=s.get("description", ""),
-                    difficulty=s.get("difficulty", "Standard"),
-                    workflow_name=failure.get("workflow_name", "Unknown"),
-                    error_message=failure.get("error_message", "Unknown error"),
-                    timestamp=failure.get("timestamp", "")
-                )
-            )
-        return overview_list
+        return connections
 
     def start_investigation(
         self,
         request: StartInvestigationRequest
     ) -> InvestigationRecord:
-        scenario_id = request.scenario_id
         investigation_id = f"INV-{uuid.uuid4().hex[:6].upper()}"
 
-        report, events = self._agent.run_investigation(
-            investigation_id=investigation_id,
-            scenario_id=scenario_id,
-            force_deterministic=request.force_deterministic
-        )
+        # If project_id is provided, execute project investigation
+        if request.project_id:
+            project_id = request.project_id
+            report, events = self._agent.run_project_investigation(
+                investigation_id=investigation_id,
+                project_id=project_id,
+                issue_description=request.issue_description
+            )
 
-        # Build causal graph
-        graph = CausalGraphEngine.build_graph_for_scenario(
-            scenario_id=scenario_id,
-            root_cause_status=report.root_cause.status,
-            evidence_list=[e.model_dump() for e in report.evidence]
-        )
+            # Build causal graph
+            graph = CausalGraphEngine.build_graph_for_project(
+                project_id=project_id,
+                changed_files=report.changed_files,
+                test_passed=(report.verification.status == "passed"),
+                evidence_list=[e.model_dump() for e in report.evidence]
+            )
 
-        record = InvestigationRecord(
-            investigation_id=investigation_id,
-            scenario_id=scenario_id,
-            report=report,
-            events=events,
-            graph=graph
-        )
+            record = InvestigationRecord(
+                investigation_id=investigation_id,
+                project_id=project_id,
+                scenario_id=None,
+                report=report,
+                events=events,
+                graph=graph
+            )
+            self._investigations[investigation_id] = record
+            return record
 
-        self._investigations[investigation_id] = record
-        return record
+        else:
+            # Fallback when no project specified: require a project
+            projects = workspace_manager.list_projects()
+            if projects:
+                # Use the most recent project
+                target_project_id = projects[0]["project_id"]
+            else:
+                # Create the built-in sample project
+                sample_meta = workspace_manager.create_sample_broken_project()
+                target_project_id = sample_meta["project_id"]
+
+            return self.start_investigation(
+                StartInvestigationRequest(
+                    project_id=target_project_id,
+                    issue_description=request.issue_description
+                )
+            )
 
     def get_investigation(self, investigation_id: str) -> Optional[InvestigationRecord]:
         return self._investigations.get(investigation_id)
@@ -202,13 +199,32 @@ class InvestigationManager:
         if not record:
             return None
 
-        # Verify chosen remediation option
-        verification_result = VerificationEngine.verify_remediation(
-            scenario_id=record.scenario_id,
-            option_id=request.option_id
-        )
+        # Re-run real verification tests
+        if record.project_id:
+            test_res = run_tests(project_id=record.project_id)
+            diff_res = get_workspace_diff(project_id=record.project_id)
 
-        record.report.verification = verification_result
+            passed = test_res.get("passed", False)
+            record.report.verification = VerificationResultModel(
+                status="passed" if passed else "failed",
+                simulated=False,
+                notice="REAL VERIFICATION VIA TEST EXECUTION",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                applied_option_id=request.option_id,
+                applied_option_title="Apply Verified Code Patch",
+                message="Tests passed cleanly." if passed else "Tests failed upon execution.",
+                command=test_res.get("command"),
+                exit_code=test_res.get("exit_code"),
+                duration_seconds=test_res.get("duration_seconds"),
+                tests_passed=test_res.get("tests_passed"),
+                tests_failed=test_res.get("tests_failed"),
+                output=test_res.get("output"),
+                patch_diff=diff_res.get("diff")
+            )
+            record.report.status = "completed" if passed else "unresolved"
+            record.report.diff = diff_res.get("diff")
+            record.report.changed_files = diff_res.get("changed_files", [])
+
         return record.report
 
     def verify_investigation(
@@ -219,27 +235,41 @@ class InvestigationManager:
         if not record:
             return None
 
-        applied_opt = record.report.verification.applied_option_id
-        if not applied_opt:
-            # Default to first recommendation if none yet applied
-            if record.report.recommendations:
-                applied_opt = record.report.recommendations[0].option_id
-            else:
-                applied_opt = "opt-workflow-update"
+        if record.project_id:
+            test_res = run_tests(project_id=record.project_id)
+            diff_res = get_workspace_diff(project_id=record.project_id)
+            passed = test_res.get("passed", False)
 
-        res = VerificationEngine.verify_remediation(
-            scenario_id=record.scenario_id,
-            option_id=applied_opt
-        )
-        record.report.verification = res
-        return res
+            res = VerificationResultModel(
+                status="passed" if passed else "failed",
+                simulated=False,
+                notice="REAL VERIFICATION VIA TEST EXECUTION",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                applied_option_id=record.report.verification.applied_option_id or "opt-apply-patch",
+                applied_option_title="Apply Verified Code Patch",
+                message=f"Real test execution: {'PASS' if passed else 'FAIL'}. {test_res.get('message')}",
+                command=test_res.get("command"),
+                exit_code=test_res.get("exit_code"),
+                duration_seconds=test_res.get("duration_seconds"),
+                tests_passed=test_res.get("tests_passed"),
+                tests_failed=test_res.get("tests_failed"),
+                output=test_res.get("output"),
+                patch_diff=diff_res.get("diff")
+            )
+            record.report.verification = res
+            return res
+
+        return None
 
     def reset_demo(self) -> Dict[str, Any]:
         self._investigations.clear()
-        reset_all_scenarios()
+        projects = workspace_manager.list_projects()
+        for p in projects:
+            workspace_manager.reset_project(p["project_id"])
+
         return {
             "status": "success",
-            "message": "Synthetic demonstration fixtures and investigation states successfully reset."
+            "message": "Project workspace reset to original state and investigation records cleared."
         }
 
 
