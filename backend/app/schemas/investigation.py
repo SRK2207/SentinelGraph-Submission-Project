@@ -145,6 +145,8 @@ class InvestigationReportModel(BaseModel):
     verification: VerificationResultModel
     diff: Optional[str] = None
     changed_files: List[str] = Field(default_factory=list)
+    execution_security: Optional[Dict[str, Any]] = None
+    regression_detected: bool = False
 
 
 class StartInvestigationRequest(BaseModel):
@@ -174,6 +176,7 @@ class ProjectUploadResponse(BaseModel):
     files: List[str]
     is_sample: bool = False
     stack: Optional[Dict[str, Any]] = None
+    execution_security: Optional[Dict[str, Any]] = None
 
 
 class ProjectOverviewModel(BaseModel):
@@ -186,6 +189,7 @@ class ProjectOverviewModel(BaseModel):
     files: List[str] = Field(default_factory=list)
     is_sample: bool = False
     stack: Optional[Dict[str, Any]] = None
+    execution_security: Optional[Dict[str, Any]] = None
 
 
 class WorkspaceDiffResponse(BaseModel):

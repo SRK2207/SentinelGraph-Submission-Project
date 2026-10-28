@@ -26,14 +26,16 @@ router = APIRouter()
 
 @router.get("/health")
 def get_health() -> Dict[str, Any]:
-    """Health check returning backend status and safe configuration parameters."""
+    """Health check returning backend status, security isolation profile, and safe configuration parameters."""
+    from backend.app.services.security.execution_sandbox import get_host_security_profile
     return {
         "status": "healthy",
         "service": "SentinelGraph AI Investigation & Repair Backend",
         "version": "2.0.0",
         "mode": "AI AGENT MODE" if settings.has_gemini_key else "API KEY REQUIRED",
         "gemini_model": settings.gemini_model,
-        "gemini_configured": settings.has_gemini_key
+        "gemini_configured": settings.has_gemini_key,
+        "execution_security": get_host_security_profile().model_dump()
     }
 
 
@@ -68,6 +70,8 @@ async def upload_project(file: UploadFile = File(...)):
     try:
         content = await file.read()
         metadata = workspace_manager.create_project_from_zip(content, file.filename)
+        from backend.app.services.security.execution_sandbox import get_host_security_profile
+        metadata["execution_security"] = get_host_security_profile().model_dump()
         return metadata
     except WorkspaceSecurityError as sec_err:
         raise HTTPException(
@@ -88,6 +92,8 @@ def create_sample_project():
     """
     try:
         metadata = workspace_manager.create_sample_broken_project()
+        from backend.app.services.security.execution_sandbox import get_host_security_profile
+        metadata["execution_security"] = get_host_security_profile().model_dump()
         return metadata
     except Exception as e:
         raise HTTPException(

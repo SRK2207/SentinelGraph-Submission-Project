@@ -1,3 +1,4 @@
+from backend.app.services.security.execution_sandbox import SecureSubprocessRunner
 import os
 import shutil
 import time
@@ -102,42 +103,39 @@ class NodeAdapter(BaseEcosystemAdapter):
 
         start_t = time.time()
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(src_dir),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
+            exit_code, combined_output, timed_out = SecureSubprocessRunner.execute(
+                cmd=cmd,
+                cwd=src_dir,
+                timeout_seconds=timeout_seconds,
                 shell=(os.name == "nt")
             )
             duration = round(time.time() - start_t, 3)
-            passed = (proc.returncode == 0)
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
-            combined_output = (stdout + ("\n--- STDERR ---\n" + stderr if stderr else "")).strip()
 
+            if timed_out:
+                return {
+                    "status": "error",
+                    "ecosystem": "node",
+                    "project_id": project_id,
+                    "error": f"Node test execution timed out after {timeout_seconds} seconds.",
+                    "passed": False,
+                    "exit_code": -1,
+                    "duration_seconds": duration,
+                    "output": combined_output
+                }
+
+            passed = (exit_code == 0)
             return {
                 "status": "success",
                 "ecosystem": "node",
                 "project_id": project_id,
                 "command": " ".join(cmd),
-                "exit_code": proc.returncode,
+                "exit_code": exit_code,
                 "passed": passed,
                 "duration_seconds": duration,
                 "tests_passed": None,
                 "tests_failed": None,
                 "output": combined_output,
                 "message": "npm test passed successfully." if passed else "npm test failed."
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "status": "error",
-                "ecosystem": "node",
-                "project_id": project_id,
-                "error": f"Node test execution timed out after {timeout_seconds} seconds.",
-                "passed": False,
-                "exit_code": -1,
-                "output": f"Node test task timed out after {timeout_seconds}s."
             }
         except Exception as e:
             return {

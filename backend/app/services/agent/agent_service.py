@@ -335,15 +335,24 @@ class AgentOrchestrator:
                         "status": "skipped",
                         "message": f"Action '{tool_name}' with identical parameters was already executed and workspace files have not changed. Redundant call avoided."
                     }
+                elif tool_name == "edit_file" and call_key in executed_actions:
+                    result = {
+                        "status": "skipped",
+                        "message": f"Identical patch for '{tool_args.get('file_path')}' was already attempted in this investigation. Repeated identical edits are suppressed to prevent thrashing. Please inspect other files, revert via revert_file, or formulate an alternate hypothesis."
+                    }
                 elif tool_name in WORKSPACE_TOOLS:
                     executed_actions.add(call_key)
                     tool_func = WORKSPACE_TOOLS[tool_name]
                     try:
                         result = tool_func(**tool_args)
-                        if tool_name in ["edit_file", "write_file", "revert_file"] and result.get("status") == "success":
+                        if tool_name in ["edit_file", "write_file"] and result.get("status") == "success":
                             workspace_version += 1
                             # File edited: invalidate cached run_tests actions so verification can run
                             executed_actions = {k for k in executed_actions if not k.startswith("run_tests:")}
+                        elif tool_name == "revert_file" and result.get("status") == "success":
+                            workspace_version += 1
+                            rev_file = tool_args.get("file_path", "")
+                            executed_actions = {k for k in executed_actions if not (k.startswith("run_tests:") or (rev_file and rev_file in k))}
                     except Exception as ex:
                         result = {"status": "error", "error": f"Tool execution failed: {str(ex)}"}
                 else:
@@ -561,6 +570,17 @@ class AgentOrchestrator:
         elif not is_verified:
             failure_err = final_test_run.get("output", "")[:250]
 
+        # Check for regressions
+        initial_failed_count = (initial_test_failure.get("tests_failed") or 1) if initial_test_failure else 0
+        final_failed_count = (final_test_run.get("tests_failed") or 0) if not is_verified else 0
+        regression_detected = False
+        if not is_verified and initial_test_failure:
+            if final_failed_count > initial_failed_count:
+                regression_detected = True
+
+        from backend.app.services.security.execution_sandbox import get_host_security_profile
+        sec_profile = get_host_security_profile().model_dump()
+
         return InvestigationReportModel(
             investigation_id=investigation_id,
             project_id=project_id,
@@ -629,5 +649,7 @@ class AgentOrchestrator:
                 patch_diff=patch_diff
             ),
             diff=patch_diff,
-            changed_files=changed_files
+            changed_files=changed_files,
+            execution_security=sec_profile,
+            regression_detected=regression_detected
         )

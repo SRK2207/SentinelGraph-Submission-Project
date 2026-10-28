@@ -1,3 +1,4 @@
+from backend.app.services.security.execution_sandbox import SecureSubprocessRunner
 import os
 import re
 import sys
@@ -63,31 +64,38 @@ class PythonAdapter(BaseEcosystemAdapter):
             cmd.append(clean_path)
 
         start_t = time.time()
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(src_dir)
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        extra_env = {
+            "PYTHONPATH": str(src_dir),
+            "PYTHONDONTWRITEBYTECODE": "1"
+        }
 
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(src_dir),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds
+            exit_code, combined_output, timed_out = SecureSubprocessRunner.execute(
+                cmd=cmd,
+                cwd=src_dir,
+                extra_env=extra_env,
+                timeout_seconds=timeout_seconds
             )
             duration = round(time.time() - start_t, 3)
 
-            passed = (proc.returncode == 0)
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
-            combined_output = (stdout + ("\n--- STDERR ---\n" + stderr if stderr else "")).strip()
+            if timed_out:
+                return {
+                    "status": "error",
+                    "ecosystem": "python",
+                    "project_id": project_id,
+                    "error": f"Test execution timed out after {timeout_seconds} seconds.",
+                    "passed": False,
+                    "exit_code": -1,
+                    "duration_seconds": duration,
+                    "output": combined_output
+                }
 
+            passed = (exit_code == 0)
             tests_passed = None
             tests_failed = None
-            if "passed" in stdout or "failed" in stdout:
-                p_match = re.search(r"(\d+)\s+passed", stdout)
-                f_match = re.search(r"(\d+)\s+failed", stdout)
+            if "passed" in combined_output or "failed" in combined_output:
+                p_match = re.search(r"(\d+)\s+passed", combined_output)
+                f_match = re.search(r"(\d+)\s+failed", combined_output)
                 if p_match:
                     tests_passed = int(p_match.group(1))
                 if f_match:
@@ -98,24 +106,13 @@ class PythonAdapter(BaseEcosystemAdapter):
                 "ecosystem": "python",
                 "project_id": project_id,
                 "command": " ".join([Path(cmd[0]).name] + cmd[1:]),
-                "exit_code": proc.returncode,
+                "exit_code": exit_code,
                 "passed": passed,
                 "duration_seconds": duration,
                 "tests_passed": tests_passed,
                 "tests_failed": tests_failed,
                 "output": combined_output,
                 "message": "Tests passed successfully." if passed else "Tests failed with errors."
-            }
-
-        except subprocess.TimeoutExpired:
-            return {
-                "status": "error",
-                "ecosystem": "python",
-                "project_id": project_id,
-                "error": f"Test execution timed out after {timeout_seconds} seconds.",
-                "passed": False,
-                "exit_code": -1,
-                "output": f"Pytest execution timed out after {timeout_seconds}s."
             }
         except Exception as e:
             return {
