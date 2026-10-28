@@ -213,11 +213,18 @@ export function ProjectUploadView({
                           <Folder className={`h-4 w-4 flex-shrink-0 ${isSelected ? "text-cyan-400" : "text-slate-400"}`} />
                           <span className="text-xs font-semibold truncate">{proj.name}</span>
                         </div>
-                        {proj.is_sample && (
-                          <span className="rounded bg-indigo-950/80 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300 border border-indigo-800">
-                            Sample
-                          </span>
-                        )}
+                        <div className="flex items-center space-x-1">
+                          {proj.stack?.primary_language && (
+                            <span className="rounded bg-cyan-950/80 px-1.5 py-0.5 text-[9px] font-semibold text-cyan-300 border border-cyan-800">
+                              {proj.stack.primary_language.toUpperCase()}
+                            </span>
+                          )}
+                          {proj.is_sample && (
+                            <span className="rounded bg-indigo-950/80 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300 border border-indigo-800">
+                              Sample
+                            </span>
+                          )}
+                        </div>
                       </div>
                       <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
                         <span>{proj.file_count} files</span>
@@ -248,6 +255,34 @@ export function ProjectUploadView({
                     Source archive: <span className="font-mono text-slate-300">{selectedProject.filename}</span> &middot;{" "}
                     {selectedProject.file_count} files extracted safely.
                   </p>
+                  {selectedProject.stack && (
+                    <div className="flex flex-wrap items-center gap-2 mt-2.5">
+                      <span className="rounded bg-cyan-950/80 px-2 py-0.5 text-[11px] font-semibold text-cyan-300 border border-cyan-800">
+                        {selectedProject.stack.primary_language?.toUpperCase() || "ECOSYSTEM"}
+                      </span>
+                      {selectedProject.stack.is_android && (
+                        <span className="rounded bg-emerald-950/80 px-2 py-0.5 text-[11px] font-semibold text-emerald-300 border border-emerald-800">
+                          Android
+                        </span>
+                      )}
+                      {selectedProject.stack.is_gradle && (
+                        <span className="rounded bg-blue-950/80 px-2 py-0.5 text-[11px] font-semibold text-blue-300 border border-blue-800">
+                          Gradle
+                        </span>
+                      )}
+                      {selectedProject.stack.suggested_command && (
+                        <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-[11px] text-slate-300 border border-slate-700">
+                          Runner: {selectedProject.stack.suggested_command}
+                        </span>
+                      )}
+                      {selectedProject.stack.missing_prerequisites && selectedProject.stack.missing_prerequisites.length > 0 && (
+                        <span className="rounded bg-amber-950/80 px-2 py-0.5 text-[11px] font-medium text-amber-300 border border-amber-800 flex items-center space-x-1">
+                          <AlertTriangle className="h-3 w-3" />
+                          <span>Prerequisite: {selectedProject.stack.missing_prerequisites.join(", ")}</span>
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Run Baseline Tests Button */}

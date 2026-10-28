@@ -10,7 +10,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 class Settings(BaseSettings):
     gemini_api_key: Optional[str] = Field(default=None, alias="GEMINI_API_KEY")
-    gemini_model: str = Field(default="gemini-3.5-flash-lite", alias="GEMINI_MODEL")
+    gemini_model: str = Field(default="gemini-flash-latest", alias="GEMINI_MODEL")
     frontend_origin: str = Field(default="http://localhost:3000", alias="FRONTEND_ORIGIN")
     max_agent_iterations: int = Field(default=8, alias="MAX_AGENT_ITERATIONS")
     max_tool_calls: int = Field(default=12, alias="MAX_TOOL_CALLS")

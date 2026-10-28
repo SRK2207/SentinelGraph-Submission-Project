@@ -243,6 +243,8 @@ ${report.diff || "No diff"}
             className={`rounded-xl border p-4 space-y-3 ${
               ver.status === "passed"
                 ? "bg-emerald-950/20 border-emerald-500/50"
+                : ver.status === "not_run"
+                ? "bg-amber-950/20 border-amber-500/50"
                 : "bg-rose-950/20 border-rose-500/50"
             }`}
           >
@@ -250,15 +252,23 @@ ${report.diff || "No diff"}
               <div className="flex items-center space-x-2">
                 {ver.status === "passed" ? (
                   <CheckCircle2 className="h-5 w-5 text-emerald-400" />
+                ) : ver.status === "not_run" ? (
+                  <AlertTriangle className="h-5 w-5 text-amber-400" />
                 ) : (
                   <XCircle className="h-5 w-5 text-rose-400" />
                 )}
                 <span className="text-sm font-bold text-white uppercase tracking-wide">
-                  Verification Status: {ver.status}
+                  Verification Status: {ver.status === "not_run" ? "PREREQUISITE LIMITATION" : ver.status}
                 </span>
               </div>
 
-              <span className="rounded bg-emerald-950/80 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-300 border border-emerald-700">
+              <span className={`rounded px-2 py-0.5 text-[10px] font-mono font-bold border ${
+                ver.status === "passed"
+                  ? "bg-emerald-950/80 text-emerald-300 border-emerald-700"
+                  : ver.status === "not_run"
+                  ? "bg-amber-950/80 text-amber-300 border-amber-700"
+                  : "bg-rose-950/80 text-rose-300 border-rose-700"
+              }`}>
                 {ver.notice}
               </span>
             </div>
@@ -266,11 +276,11 @@ ${report.diff || "No diff"}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
               <div className="rounded bg-surface p-2 border border-surface-border">
                 <span className="text-[10px] text-slate-500 block uppercase">Test Command</span>
-                <span className="font-mono text-cyan-300 text-[11px] truncate block">{ver.command || "pytest"}</span>
+                <span className="font-mono text-cyan-300 text-[11px] truncate block">{ver.command || "N/A"}</span>
               </div>
               <div className="rounded bg-surface p-2 border border-surface-border">
                 <span className="text-[10px] text-slate-500 block uppercase">Exit Code</span>
-                <span className="font-mono text-slate-200 text-[11px]">{ver.exit_code ?? 0}</span>
+                <span className="font-mono text-slate-200 text-[11px]">{ver.exit_code ?? "N/A"}</span>
               </div>
               <div className="rounded bg-surface p-2 border border-surface-border">
                 <span className="text-[10px] text-slate-500 block uppercase">Duration</span>

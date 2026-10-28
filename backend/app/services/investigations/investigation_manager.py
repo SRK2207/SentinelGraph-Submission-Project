@@ -184,11 +184,11 @@ class InvestigationManager:
                     ),
                     root_cause=RootCauseModel(
                         title="Investigation Incomplete",
-                        description=f"Agent paused during execution: {err_msg}",
-                        confidence_score=0.3,
-                        confidence_label="LOW",
-                        affected_component=project_id,
-                        primary_evidence_id="err-1"
+                        explanation=f"Agent paused during execution: {err_msg}",
+                        confidence=0.3,
+                        confidence_label="Unconfirmed / Insufficient Evidence",
+                        status="unconfirmed",
+                        evidence_ids=[]
                     ),
                     hypotheses=[],
                     evidence=[],
@@ -198,10 +198,10 @@ class InvestigationManager:
                         RemediationOptionModel(
                             option_id="opt-retry",
                             title="Retry Investigation",
+                            target=project_id,
                             description="Retry autonomous investigation and repair with refreshed context.",
-                            risk_level="LOW",
-                            requires_approval=False,
-                            estimated_recovery_minutes=1
+                            trade_offs="Consumes an additional AI reasoning turn.",
+                            resolves_failure=False
                         )
                     ],
                     remaining_unknowns=["Automated synthesis did not complete."],
@@ -217,10 +217,10 @@ class InvestigationManager:
                         tests_passed=test_res.get("tests_passed"),
                         tests_failed=test_res.get("tests_failed"),
                         output=test_res.get("output"),
-                        patch_diff=diff_res.get("unified_diff")
+                        patch_diff=diff_res.get("diff")
                     ),
-                    diff=diff_res.get("unified_diff", ""),
-                    changed_files=diff_res.get("modified_files", [])
+                    diff=diff_res.get("diff", ""),
+                    changed_files=diff_res.get("changed_files", [])
                 )
 
             # Build causal graph

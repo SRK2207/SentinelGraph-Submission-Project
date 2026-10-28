@@ -173,6 +173,7 @@ class ProjectUploadResponse(BaseModel):
     created_at: str
     files: List[str]
     is_sample: bool = False
+    stack: Optional[Dict[str, Any]] = None
 
 
 class ProjectOverviewModel(BaseModel):
@@ -184,6 +185,7 @@ class ProjectOverviewModel(BaseModel):
     created_at: str
     files: List[str] = Field(default_factory=list)
     is_sample: bool = False
+    stack: Optional[Dict[str, Any]] = None
 
 
 class WorkspaceDiffResponse(BaseModel):

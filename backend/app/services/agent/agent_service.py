@@ -10,6 +10,7 @@ from backend.app.core.config import settings
 from backend.app.services.workspace.workspace_manager import workspace_manager
 from backend.app.services.tools.workspace_tools import (
     WORKSPACE_TOOLS,
+    detect_project_stack,
     list_project_files,
     search_code,
     read_file,
@@ -167,6 +168,31 @@ class AgentOrchestrator:
             )
         )
 
+        # Phase 1: General-Purpose Stack & Ecosystem Detection
+        stack_info = detect_project_stack(project_id=project_id)
+        events.append(
+            InvestigationEventModel(
+                event_id=f"evt-{len(events) + 1}",
+                timestamp=self._now(),
+                stage="Stack Detection",
+                type="status",
+                message=f"Ecosystem detected: {stack_info.get('summary')}",
+                is_gemini_native=True
+            )
+        )
+        if stack_info.get("missing_prerequisites"):
+            prereqs_str = "; ".join(stack_info.get("missing_prerequisites"))
+            events.append(
+                InvestigationEventModel(
+                    event_id=f"evt-{len(events) + 1}",
+                    timestamp=self._now(),
+                    stage="Environment Prerequisites",
+                    type="status",
+                    message=f"Prerequisite Alert: {prereqs_str}",
+                    is_gemini_native=True
+                )
+            )
+
         # Pre-gather baseline diagnostic status (tests and manifests)
         # This saves multiple API round trips, prevents exhausting RPM quotas, and gives the model instant context
         baseline_test = run_tests(project_id=project_id)
@@ -177,13 +203,14 @@ class AgentOrchestrator:
         new_evidence = self._extract_workspace_evidence("run_tests", {"project_id": project_id}, baseline_test)
         evidence_list.extend(new_evidence)
 
+        status_label = "PASSED" if baseline_test.get("passed") else ("PREREQUISITE MISSING" if baseline_test.get("status") == "prerequisite_missing" else "FAILED")
         events.append(
             InvestigationEventModel(
                 event_id=f"evt-{len(events) + 1}",
                 timestamp=self._now(),
                 stage="Baseline Diagnosis",
                 type="tool_result",
-                message=f"Diagnostic tests: {'PASSED' if baseline_test.get('passed') else 'FAILED'}",
+                message=f"Diagnostic tests: {status_label}",
                 tool_name="run_tests",
                 tool_result=baseline_test,
                 is_gemini_native=True
@@ -193,6 +220,7 @@ class AgentOrchestrator:
         client = genai.Client(api_key=self.api_key)
 
         tool_list = [
+            detect_project_stack,
             list_project_files,
             search_code,
             read_file,
@@ -205,16 +233,17 @@ class AgentOrchestrator:
             get_workspace_diff
         ]
 
+        lang_str = stack_info.get("primary_language", "unknown").title()
         system_instruction = (
-            "You are SentinelGraph, an expert autonomous AI software project investigation and repair agent.\n"
-            "You are operating on a real software project inside an isolated workspace.\n"
-            f"The target project_id is: '{project_id}'.\n\n"
+            f"You are SentinelGraph, an expert autonomous AI software engineer.\n"
+            f"Target project_id: '{project_id}' ({project.get('name')}).\n"
+            f"Detected technology stack: {lang_str} ({stack_info.get('summary')}).\n\n"
             "YOUR INVESTIGATION & REPAIR PROTOCOL:\n"
             "1. Inspect the stack trace, failing file, and assertion provided in the diagnostic baseline.\n"
             "2. Read the failing source files with `read_file` or search with `search_code` to locate the defect.\n"
-            "3. Apply a targeted fix using `edit_file` (or `write_file`) to resolve the root cause.\n"
-            "4. Immediately re-run `run_tests` to verify that all tests now pass!\n"
-            "5. Call `get_workspace_diff` to review your patch.\n"
+            "3. If tests can run on host, apply a targeted fix using `edit_file` (or `write_file`) and re-run `run_tests`.\n"
+            "4. If environment build tools (e.g. Android SDK, Gradle) are missing on host, explain the defect and required host configuration.\n"
+            "5. Call `get_workspace_diff` to review your patch if edits were made.\n"
             "6. Formulate a final summary explaining what broke, why it broke, and how your fix resolved it.\n"
             "Base all your reasoning on actual tool execution outputs."
         )
@@ -256,6 +285,8 @@ class AgentOrchestrator:
         response = self._send_chat_message(chat, initial_prompt, events)
         iterations = 0
         total_tool_calls = 0
+        executed_actions: set = set()
+        workspace_version = 0
 
         initial_test_failure = None
 
@@ -298,10 +329,21 @@ class AgentOrchestrator:
                     )
                 )
 
-                if tool_name in WORKSPACE_TOOLS:
+                call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+                if tool_name in ["run_tests", "discover_tests_and_commands", "inspect_dependencies", "detect_project_stack"] and call_key in executed_actions:
+                    result = {
+                        "status": "skipped",
+                        "message": f"Action '{tool_name}' with identical parameters was already executed and workspace files have not changed. Redundant call avoided."
+                    }
+                elif tool_name in WORKSPACE_TOOLS:
+                    executed_actions.add(call_key)
                     tool_func = WORKSPACE_TOOLS[tool_name]
                     try:
                         result = tool_func(**tool_args)
+                        if tool_name in ["edit_file", "write_file", "revert_file"] and result.get("status") == "success":
+                            workspace_version += 1
+                            # File edited: invalidate cached run_tests actions so verification can run
+                            executed_actions = {k for k in executed_actions if not k.startswith("run_tests:")}
                     except Exception as ex:
                         result = {"status": "error", "error": f"Tool execution failed: {str(ex)}"}
                 else:
@@ -455,7 +497,22 @@ class AgentOrchestrator:
 
         observed_ids = [e.id for e in evidence_list]
 
-        if is_verified:
+        is_prereq_missing = (final_test_run.get("status") == "prerequisite_missing")
+
+        if is_prereq_missing:
+            status = "unresolved"
+            conf = 0.50
+            conf_label = "Unconfirmed / Insufficient Evidence"
+            rc_status = "unconfirmed"
+            rc_title = "Host Environment Build Tool Prerequisite Missing"
+            rc_explanation = (
+                final_test_run.get("output") or
+                "The project ecosystem (e.g. Gradle or Android SDK) requires toolchains not installed or configured on the host machine."
+            )
+            ver_status = "not_run"
+            ver_msg = final_test_run.get("message", "Host environment lacks required toolchain for test execution.")
+            remaining_unknowns = ["Host build tools (Gradle / Android SDK) required for live dynamic test execution"]
+        elif is_verified:
             status = "completed"
             conf = 0.98
             conf_label = "High Confidence"
@@ -472,6 +529,7 @@ class AgentOrchestrator:
                 f"Exit Code: {final_test_run.get('exit_code')}, Duration: {final_test_run.get('duration_seconds')}s. "
                 f"Tests passed: {final_test_run.get('tests_passed', 'All')}."
             )
+            remaining_unknowns = []
         else:
             status = "unresolved"
             conf = 0.45
@@ -485,17 +543,20 @@ class AgentOrchestrator:
             ver_msg = (
                 f"Real verification FAILED. Test command exited with code {final_test_run.get('exit_code')}."
             )
+            remaining_unknowns = ["Unresolved test assertion errors in test suite"]
 
         summary_text = (
             gemini_reasoning.strip() if gemini_reasoning and len(gemini_reasoning.strip()) > 30
             else (
                 f"Autonomous investigation for project '{project.get('name')}'. "
-                f"{'Defect successfully fixed and verified against real tests.' if is_verified else 'Test suite execution encountered failures.'}"
+                f"{'Defect successfully fixed and verified against real tests.' if is_verified else ('Environment build prerequisites missing on host.' if is_prereq_missing else 'Test suite execution encountered failures.')}"
             )
         )
 
         failure_err = "Test failures detected"
-        if initial_test_failure:
+        if is_prereq_missing:
+            failure_err = final_test_run.get("message", "Environment toolchain prerequisite missing")
+        elif initial_test_failure:
             failure_err = initial_test_failure.get("output", "")[:250]
         elif not is_verified:
             failure_err = final_test_run.get("output", "")[:250]
@@ -550,7 +611,7 @@ class AgentOrchestrator:
                     resolves_failure=is_verified
                 )
             ],
-            remaining_unknowns=[] if is_verified else ["Unresolved test assertion errors in test suite"],
+            remaining_unknowns=remaining_unknowns,
             verification=VerificationResultModel(
                 status=ver_status,
                 simulated=False,

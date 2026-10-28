@@ -7,6 +7,7 @@ from backend.app.schemas.investigation import (
     GraphNodePosition,
     GraphNodeData
 )
+from backend.app.services.stack.stack_detector import StackDetector
 
 
 class CausalGraphEngine:
@@ -23,50 +24,99 @@ class CausalGraphEngine:
         evidence_list: Optional[List[Dict[str, Any]]] = None
     ) -> GraphDataModel:
         g = nx.DiGraph()
-        files = changed_files or ["customer_service.py"]
-        primary_file = files[0] if files else "source_code.py"
         ev_ids = [e.get("id", "") for e in (evidence_list or [])]
+
+        # Dynamically determine the primary source file based on project inspection
+        meta = None
+        try:
+            meta = StackDetector.detect_workspace(project_id)
+        except Exception:
+            pass
+
+        primary_file = None
+        if changed_files and len(changed_files) > 0:
+            primary_file = changed_files[0]
+        elif evidence_list:
+            for ev in evidence_list:
+                f = ev.get("metadata", {}).get("file")
+                if f:
+                    primary_file = f
+                    break
+
+        if not primary_file and meta and meta.source_files_sample:
+            # Pick first non-manifest source file
+            non_manifests = [
+                f for f in meta.source_files_sample
+                if not any(f.endswith(m) for m in [".json", ".toml", ".txt", ".md", ".xml", ".properties"])
+            ]
+            primary_file = non_manifests[0] if non_manifests else meta.source_files_sample[0]
+
+        if not primary_file:
+            primary_file = "src/main"
+
+        # Determine runner label
+        is_android = meta.is_android if meta else False
+        is_gradle = meta.is_gradle if meta else False
+        is_node = meta.is_node if meta else False
+
+        if is_android:
+            runner_label = "Android Test Suite (JUnit / Instrumented)"
+        elif is_gradle:
+            runner_label = "Gradle Test Runner (JUnit)"
+        elif is_node:
+            runner_label = "Node.js Test Runner (Jest/npm)"
+        else:
+            runner_label = "Pytest Test Runner"
 
         # Node 1: Defective / Modified Source File
         g.add_node(
             "node-source-file",
             label=f"Source: {primary_file}",
-            component_type="api_schema",
+            component_type="source_file",
             status="probable_cause",
-            explanation=f"Source file '{primary_file}' contained the defect breaking contract expectations.",
-            evidence_ids=[eid for eid in ev_ids if "FILE" in eid or "PATCH" in eid],
+            explanation=f"Source file '{primary_file}' evaluated during investigation.",
+            evidence_ids=[eid for eid in ev_ids if "FILE" in eid or "PATCH" in eid or "SEARCH" in eid],
             metadata={"file": primary_file}
         )
 
         # Node 2: Dependent / Test Consumer
         g.add_node(
             "node-test-file",
-            label="Consumer / Test Suite",
-            component_type="workflow_step",
+            label=runner_label,
+            component_type="test_file",
             status="affected_component",
-            explanation="Dependent consumer or test runner executing against the component.",
+            explanation=f"Target verification test suite ({runner_label}).",
             evidence_ids=[eid for eid in ev_ids if "TEST" in eid],
             metadata={"project_id": project_id}
         )
 
         # Node 3: Failure Execution Event
+        has_prereq_missing = bool(meta and meta.missing_prerequisites)
+        fail_label = "Prerequisite Limitation" if has_prereq_missing else "Test Suite Execution"
+        fail_expl = (
+            f"Missing prerequisites on host: {'; '.join(meta.missing_prerequisites)}"
+            if has_prereq_missing else
+            ("Tests passed successfully." if test_passed else "Test execution failed with assertion/error trace.")
+        )
         g.add_node(
             "node-failure-event",
-            label="Test Suite Execution",
+            label=fail_label,
             component_type="failure",
             status="confirmed",
-            explanation="Initial test execution failed with exit code or assertion failure.",
+            explanation=fail_expl,
             evidence_ids=[eid for eid in ev_ids if "TEST" in eid],
-            metadata={"project_id": project_id}
+            metadata={"project_id": project_id, "has_prereq_missing": has_prereq_missing}
         )
 
         # Node 4: Repair & Verification
+        repair_status = "confirmed" if test_passed else "unverified_hypothesis"
+        repair_label = "Verified Code Repair" if test_passed else ("Prerequisite Assessment" if has_prereq_missing else "Unverified Patch")
         g.add_node(
             "node-repair-patch",
-            label="Verified Code Repair",
+            label=repair_label,
             component_type="commit",
-            status="confirmed" if test_passed else "unverified_hypothesis",
-            explanation="Targeted patch applied and verified by real test execution.",
+            status=repair_status,
+            explanation="Targeted patch applied and verified by real tests." if test_passed else "Investigation findings awaiting live environment verification.",
             evidence_ids=[eid for eid in ev_ids if "PATCH" in eid],
             metadata={"verified": test_passed}
         )
@@ -96,6 +146,26 @@ class CausalGraphEngine:
             relationship="modified",
             animated=False
         )
+
+        # If missing host prerequisites, add an external prerequisite node
+        if has_prereq_missing:
+            g.add_node(
+                "node-prereq-env",
+                label="Host Build Tools",
+                component_type="external_service",
+                status="unverified_hypothesis",
+                explanation=f"Host machine requires: {', '.join(meta.missing_prerequisites)}",
+                evidence_ids=[],
+                metadata={"missing": meta.missing_prerequisites}
+            )
+            g.add_edge(
+                "node-prereq-env",
+                "node-failure-event",
+                id="edge-p4",
+                label="blocks",
+                relationship="incompatible_with",
+                animated=True
+            )
 
         return CausalGraphEngine._convert_networkx_to_model(g)
 

@@ -158,6 +158,13 @@ class WorkspaceManager:
             raise WorkspaceSecurityError(f"Failed to extract zip archive safely: {str(e)}")
 
         project_name = Path(filename).stem
+        stack_dict = None
+        try:
+            from backend.app.services.stack.stack_detector import StackDetector
+            stack_dict = StackDetector.detect_path(src_dir).model_dump()
+        except Exception:
+            pass
+
         metadata = {
             "project_id": project_id,
             "name": project_name,
@@ -167,6 +174,7 @@ class WorkspaceManager:
             "uncompressed_size_bytes": total_extracted_size,
             "created_at": self._now(),
             "files": sorted(extracted_files),
+            "stack": stack_dict,
         }
 
         (project_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -383,6 +391,13 @@ class WorkspaceManager:
             o_file.write_text(content, encoding="utf-8")
             extracted_files.append(rel_path)
 
+        stack_dict = None
+        try:
+            from backend.app.services.stack.stack_detector import StackDetector
+            stack_dict = StackDetector.detect_path(src_dir).model_dump()
+        except Exception:
+            pass
+
         metadata = {
             "project_id": project_id,
             "name": "Invoice Billing Service (Sample Broken Project)",
@@ -392,7 +407,8 @@ class WorkspaceManager:
             "uncompressed_size_bytes": sum(len(c) for c in files.values()),
             "created_at": self._now(),
             "files": sorted(extracted_files),
-            "is_sample": True
+            "is_sample": True,
+            "stack": stack_dict
         }
 
         (project_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")

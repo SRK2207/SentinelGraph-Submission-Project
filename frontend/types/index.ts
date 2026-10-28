@@ -154,6 +154,7 @@ export interface ProjectOverview {
   created_at: string;
   files: string[];
   is_sample?: boolean;
+  stack?: Record<string, any> | null;
 }
 
 export interface WorkspaceDiff {

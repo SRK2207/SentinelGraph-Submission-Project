@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from backend.app.services.workspace.workspace_manager import workspace_manager, WorkspaceSecurityError
+from backend.app.services.stack.stack_detector import StackDetector
+from backend.app.services.adapters.registry import adapter_registry
 
 
 IGNORED_DIRECTORIES = {".git", "__pycache__", "venv", ".venv", "node_modules", ".pytest_cache", ".next", "dist", "build"}
@@ -196,128 +198,67 @@ def inspect_dependencies(project_id: str, **kwargs) -> Dict[str, Any]:
         return {"status": "error", "error": f"Dependency inspection failed: {str(e)}"}
 
 
-def discover_tests_and_commands(project_id: str, **kwargs) -> Dict[str, Any]:
+def detect_project_stack(project_id: str, **kwargs) -> Dict[str, Any]:
     """
-    Discover existing test files, test frameworks, and test runner execution commands.
+    Detect project technology stack, language, build system, test framework,
+    and host tool prerequisites.
     """
     try:
-        src_dir = workspace_manager.get_src_dir(project_id)
-        test_files = []
-        framework = "unknown"
-        suggested_command = None
-
-        for root, dirs, files in os.walk(src_dir):
-            dirs[:] = [d for d in dirs if d not in IGNORED_DIRECTORIES]
-            for file in files:
-                rel = (Path(root) / file).relative_to(src_dir).as_posix()
-                if (
-                    file.startswith("test_")
-                    or file.endswith("_test.py")
-                    or "tests/" in rel
-                    or file.endswith(".test.js")
-                    or file.endswith(".spec.js")
-                ):
-                    test_files.append(rel)
-
-        if any(f.endswith(".py") for f in test_files):
-            framework = "pytest"
-            suggested_command = "pytest"
-        elif any(f.endswith(".js") or f.endswith(".ts") for f in test_files):
-            framework = "npm test"
-            suggested_command = "npm test"
-
+        meta = StackDetector.detect_workspace(project_id)
         return {
             "status": "success",
             "project_id": project_id,
-            "test_framework": framework,
-            "suggested_command": suggested_command,
-            "total_test_files": len(test_files),
-            "test_files": test_files
+            "primary_language": meta.primary_language,
+            "detected_languages": meta.detected_languages,
+            "build_systems": meta.build_systems,
+            "test_frameworks": meta.test_frameworks,
+            "is_android": meta.is_android,
+            "is_gradle": meta.is_gradle,
+            "is_node": meta.is_node,
+            "is_python": meta.is_python,
+            "available_runners": meta.available_runners,
+            "missing_prerequisites": meta.missing_prerequisites,
+            "suggested_command": meta.suggested_command,
+            "summary": meta.summary
         }
+    except Exception as e:
+        return {"status": "error", "error": f"Stack detection failed: {str(e)}"}
+
+
+def discover_tests_and_commands(project_id: str, **kwargs) -> Dict[str, Any]:
+    """
+    Discover existing test files, test frameworks, and test runner execution commands
+    using evidence-based ecosystem adapters.
+    """
+    try:
+        src_dir = workspace_manager.get_src_dir(project_id)
+        meta = StackDetector.detect_workspace(project_id)
+        adapter = adapter_registry.get_adapter(meta)
+        return adapter.discover_tests(project_id, src_dir, meta)
     except Exception as e:
         return {"status": "error", "error": f"Test discovery failed: {str(e)}"}
 
 
 def run_tests(project_id: str, test_command: Optional[str] = None, test_path: Optional[str] = None, **kwargs) -> Dict[str, Any]:
     """
-    Execute tests inside the project workspace using a secure subprocess environment.
-    Returns actual command output, execution time, pass/fail status, and exit code.
+    Execute tests inside the project workspace using the appropriate ecosystem adapter.
+    Accurately routes to Gradle, npm, pytest, or reports missing environment prerequisites.
+    Never falls back to pytest on Kotlin/Gradle/Android projects.
     """
     try:
         src_dir = workspace_manager.get_src_dir(project_id)
         if not src_dir.exists():
             return {"status": "error", "error": f"Project workspace '{project_id}' does not exist."}
 
-        # Determine executable command
-        # Security: only allow safe test runners
-        cmd = []
-        custom_cmd = test_command.strip() if test_command else ""
-
-        if not custom_cmd or custom_cmd.startswith("pytest"):
-            cmd = [sys.executable, "-m", "pytest", "-v"]
-            if test_path:
-                safe_target = workspace_manager.resolve_safe_path(project_id, test_path)
-                cmd.append(safe_target.relative_to(src_dir).as_posix())
-        elif custom_cmd.startswith("unittest") or "unittest" in custom_cmd:
-            cmd = [sys.executable, "-m", "unittest", "discover", "-v"]
-        elif custom_cmd.startswith("npm test"):
-            cmd = ["npm", "test"]
-        else:
-            # Fall back to pytest
-            cmd = [sys.executable, "-m", "pytest", "-v"]
-
-        start_t = time.time()
-        # Set environment with PYTHONPATH pointing to src_dir so project modules resolve
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(src_dir)
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-
-        proc = subprocess.run(
-            cmd,
-            cwd=str(src_dir),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=25
+        meta = StackDetector.detect_workspace(project_id)
+        adapter = adapter_registry.get_adapter(meta)
+        return adapter.execute_diagnostics(
+            project_id=project_id,
+            src_dir=src_dir,
+            metadata=meta,
+            test_command=test_command,
+            test_path=test_path
         )
-        duration = round(time.time() - start_t, 3)
-
-        passed = (proc.returncode == 0)
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        combined_output = (stdout + ("\n--- STDERR ---\n" + stderr if stderr else "")).strip()
-
-        # Parse summary counts if pytest
-        tests_passed = None
-        tests_failed = None
-        if "passed" in stdout or "failed" in stdout:
-            p_match = re.search(r"(\d+)\s+passed", stdout)
-            f_match = re.search(r"(\d+)\s+failed", stdout)
-            if p_match:
-                tests_passed = int(p_match.group(1))
-            if f_match:
-                tests_failed = int(f_match.group(1))
-
-        return {
-            "status": "success",
-            "project_id": project_id,
-            "command": " ".join([Path(cmd[0]).name] + cmd[1:]),
-            "exit_code": proc.returncode,
-            "passed": passed,
-            "duration_seconds": duration,
-            "tests_passed": tests_passed,
-            "tests_failed": tests_failed,
-            "output": combined_output,
-            "message": "Tests passed successfully." if passed else "Tests failed with errors."
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "error",
-            "project_id": project_id,
-            "error": "Test execution timed out after 25 seconds.",
-            "passed": False,
-            "exit_code": -1
-        }
     except Exception as e:
         return {"status": "error", "error": f"Failed to execute tests: {str(e)}"}
 
@@ -426,6 +367,7 @@ def get_workspace_diff(project_id: str, **kwargs) -> Dict[str, Any]:
 
 # Registry of tools available for the live AI agent
 WORKSPACE_TOOLS = {
+    "detect_project_stack": detect_project_stack,
     "list_project_files": list_project_files,
     "search_code": search_code,
     "read_file": read_file,
