@@ -8,7 +8,7 @@ Modern software systems frequently suffer cross-system contract regressions — 
 
 Instead of developers manually combing through error logs, test failure traces, imported dependencies, and Git histories, SentinelGraph:
 1. **Safely Ingests Project Archives**: Accepts `.zip` software project uploads into dedicated, isolated filesystem sandboxes with strict path-traversal safeguards.
-2. **Autonomously Discovers & Runs Real Tests**: Discovers test suites (`pytest`, `unittest`, `npm test`), executes them in sandboxed subprocesses, and observes actual exit codes and error traces.
+2. **Autonomously Discovers & Runs Real Tests**: Discovers test suites (`pytest`, `unittest`, `npm test`), executes them in sandboxed subprocesses with zero-leak environment scrubbing, and observes actual exit codes and error traces.
 3. **Explores Real Codebases with Dynamic Tools**: Inspects failing assertions, reads source files, searches definitions across the workspace, and identifies the root-cause defect.
 4. **Applies Targeted Code Patches**: Directly modifies source files within the isolated working directory.
 5. **Performs Real Verification**: Re-runs the project's real test suite to prove that all tests pass before and after the repair, generating real unified diffs and execution logs.
@@ -33,6 +33,7 @@ Instead of developers manually combing through error logs, test failure traces, 
 |  - /api/projects/run-tests: Real subprocess pytest / test runner execution      |
 |  - /api/projects/diff     : difflib unified diff between original & current src |
 |  - /api/investigations    : Live Gemini Agent orchestration & repair loop       |
+|  - /api/health            : Security isolation boundary & environment profile   |
 +---------------------------------------------------------------------------------+
          |                                                 |
          v                                                 v
@@ -73,7 +74,8 @@ Instead of developers manually combing through error logs, test failure traces, 
 
 ### 1. Clone & Enter Repository
 ```bash
-cd sentinelgraph-submission
+git clone https://github.com/SRK2207/SentinelGraph-Submission-Project.git
+cd SentinelGraph-Submission-Project
 ```
 
 ### 2. Backend Setup
@@ -100,8 +102,8 @@ Edit `backend/.env`:
 # Optional: Add your Google AI Studio Gemini API key
 GEMINI_API_KEY=your_gemini_api_key_here
 
-# Configurable Gemini Model
-GEMINI_MODEL=gemini-2.5-flash
+# Configurable Gemini Model (e.g. gemini-flash-lite-latest, gemini-flash-latest)
+GEMINI_MODEL=gemini-flash-lite-latest
 
 # Frontend Origin for CORS
 FRONTEND_ORIGIN=http://localhost:3000
@@ -124,9 +126,9 @@ npm install
 ## Running the Application Locally
 
 ### 1. Start the FastAPI Backend
-From the workspace root:
+From the repository root:
 ```powershell
-.\backend\venv\Scripts\uvicorn.exe backend.app.main:app --host 127.0.0.1 --port 8000 --reload
+.\backend\venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 The backend starts at `http://127.0.0.1:8000`. You can inspect the interactive OpenAPI documentation at `http://127.0.0.1:8000/docs`.
 
@@ -134,38 +136,61 @@ The backend starts at `http://127.0.0.1:8000`. You can inspect the interactive O
 In a separate terminal:
 ```bash
 cd frontend
-npm run dev
+npm run start
 ```
-Open your browser at `http://localhost:3000`.
+*(Or `npm run dev` for development mode).* Open your browser at `http://localhost:3000`.
 
 ---
 
 ## Running Automated Backend Tests
 
-The project includes an automated test suite with **22 passing test cases** verifying real workspace extraction, security, subprocess test execution, file editing, and agent dispatch:
+The project includes an automated test suite with **35 passing test cases** across backend integration, general-purpose multi-stack routing, and security isolation:
 ```powershell
-.\backend\venv\Scripts\pytest.exe backend\app\tests\test_backend.py -v
+.\backend\venv\Scripts\pytest.exe backend\app\tests -v
 ```
 
-All 22 tests verify:
-- Health, dashboard, and connection endpoints
-- Safe ZIP extraction and strict rejection of path traversal attempts (`../../evil.txt`)
-- Project workspace file listing, code search, and bounded file reading
-- Dependency manifest discovery (`requirements.txt`, `pyproject.toml`, `package.json`)
-- Subprocess test execution capturing real test failures (`KeyError: 'customer_email'`)
-- Targeted file editing and real file modification in the isolated workspace
-- Re-executing real tests to confirm they PASS after repair (`exit_code == 0`)
-- Generating real unified diffs comparing original and patched files
-- File reversion and project reset back to original uploaded snapshots
-- Explicit error handling when `GEMINI_API_KEY` is missing (no simulated fallback)
-- Mocked Gemini tool-calling loop verifying real project repair and test validation
-- End-to-end project workflow API integration
+All 35 tests verify:
+- **Core Backend Suite (22 tests)**:
+  - Health, dashboard, and connection endpoints
+  - Safe ZIP extraction and strict rejection of path traversal attempts (`../../evil.txt`)
+  - Project workspace file listing, code search, and bounded file reading
+  - Dependency manifest discovery (`requirements.txt`, `pyproject.toml`, `package.json`)
+  - Subprocess test execution capturing real test failures (`KeyError: 'customer_email'`)
+  - Targeted file editing and real file modification in the isolated workspace
+  - Re-executing real tests to confirm they PASS after repair (`exit_code == 0`)
+  - Generating real unified diffs comparing original and patched files
+  - File reversion and project reset back to original uploaded snapshots
+  - Explicit error handling when `GEMINI_API_KEY` is missing (no simulated fallback)
+  - End-to-end project workflow API integration
+- **General-Purpose Multi-Stack Adapters (7 tests)**:
+  - Stack detection for Python, Node.js/TypeScript, and Gradle/Android
+  - Adapter routing (ensuring Gradle/Android never misroutes to pytest)
+  - Missing build toolchain prerequisite handling with honest reporting
+  - Causal graph file-anchoring without phantom fallbacks
+- **Security & Isolation Boundary (6 tests)**:
+  - Zero-leak environment sanitization: Proves `GEMINI_API_KEY` and host credentials are strictly scrubbed from subprocess environments
+  - Output stream buffer capping (512KB cap) preventing memory exhaustion DoS
+  - Reliable process-tree termination on timeout using `taskkill /F /T`
+  - Workspace directory traversal rejection
+  - Snapshot immutability ensuring `original/` is never modified during agent investigation
+  - Host execution security profile capability reporting (`HOST_PROCESS_RESTRICTED`)
 
 ---
 
 ## Security & Isolation Safeguards
 
-1. **Path-Traversal Protection**: All archive extractions and filesystem tool calls (`read_file`, `write_file`, `edit_file`) validate that resolved paths strictly reside within the isolated workspace `src/` directory. Any attempt to navigate with `..` or absolute paths is rejected with `WorkspaceSecurityError`.
-2. **Subprocess Isolation**: Tests run in an isolated subprocess with the working directory strictly set to the workspace's `src/` directory and `PYTHONDONTWRITEBYTECODE=1`. Command execution is protected by a strict 25-second timeout to prevent runaway processes.
-3. **Preserved Original Snapshots**: Every project workspace maintains an immutable `original/` copy of the uploaded files, allowing instant rollback and verifiable unified diff generation.
-4. **Credential Security**: `GEMINI_API_KEY` remains strictly on the backend. Frontend code never receives or exposes API credentials.
+1. **Zero-Leak Environment Scrubbing**: Tests run with an explicitly whitelisted set of system variables (`SYSTEMROOT`, `PATH`, etc.). All variables matching `(KEY|SECRET|TOKEN|CREDENTIAL|PASSWORD|AUTH|GEMINI|API|AWS|AZURE|GCP)` are purged before subprocess launch.
+2. **Output Stream Bounding**: Stdout and stderr streams are capped at 512KB to prevent memory exhaustion DoS from infinite loop print statements.
+3. **Process-Tree Termination**: Command execution is bounded by timeouts, reliably terminating the entire process hierarchy on Windows/POSIX.
+4. **Path-Traversal Protection**: All archive extractions and filesystem tool calls (`read_file`, `write_file`, `edit_file`) validate that resolved paths strictly reside within the workspace `src/` directory.
+5. **Preserved Original Snapshots**: Every project workspace maintains an immutable `original/` copy of the uploaded files, allowing instant rollback and verifiable unified diff generation.
+6. **Transparent Capability Disclaimers**: In environments without Docker or WSL, SentinelGraph runs in `HOST_PROCESS_RESTRICTED` mode and explicitly reports this limitation in `/api/health` and investigation records rather than making unverified containerization claims.
+
+---
+
+## Detailed Empirical Validation & Security Reports
+
+For in-depth analysis, telemetry, Mermaid diagrams, and empirical results across multiple stacks and complex defect scenarios, refer to the documentation in `docs/`:
+- [**Security & Advanced Autonomous Repair Evaluation Report**](docs/SECURITY_AND_ADVANCED_VALIDATION_REPORT.md): In-depth report covering the 6 advanced defect fixtures (coordinated multi-file defects, configuration dependency alignment, red herrings, regression guards, and unresolvable contradictory specifications) executed against live models.
+- [**Empirical Validation Report**](docs/EMPIRICAL_VALIDATION_REPORT.md): Initial multi-stack autonomous repair validation covering Python, Node.js, and Kotlin/Gradle.
+- [**Architecture Guide**](docs/ARCHITECTURE.md): Architectural deep-dive into the agent loop and graph engine.
